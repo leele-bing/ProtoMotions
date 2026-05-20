@@ -596,6 +596,20 @@ def extract_control_info(
 
     control_info = {}
 
+    def _as_optional_float(value):
+        """Convert dm_control/MJCF numeric values to plain Python floats."""
+        if value is None:
+            return None
+        if isinstance(value, np.ndarray):
+            if value.size != 1:
+                raise ValueError(
+                    f"Expected scalar control parameter, got array with shape {value.shape}"
+                )
+            return float(value.item())
+        if isinstance(value, np.generic):
+            return float(value)
+        return value
+
     def _extract_joint_control_params(joint_name, joint):
         """Extract control parameters from a joint element."""
         # Extract stiffness and damping from joint attributes
@@ -629,6 +643,13 @@ def extract_control_info(
         if isinstance(effort_limit, np.ndarray):
             effort_limit = effort_limit[1]
 
+        stiffness = _as_optional_float(stiffness)
+        damping = _as_optional_float(damping)
+        armature = _as_optional_float(armature)
+        friction = _as_optional_float(friction)
+        effort_limit = _as_optional_float(effort_limit)
+        velocity_limit = _as_optional_float(velocity_limit)
+
         if override_control_info is not None:
             for (
                 joint_expr,
@@ -648,6 +669,13 @@ def extract_control_info(
                         effort_limit = override_joint_control_info.effort_limit
                     if override_joint_control_info.velocity_limit is not None:
                         velocity_limit = override_joint_control_info.velocity_limit
+
+        stiffness = _as_optional_float(stiffness)
+        damping = _as_optional_float(damping)
+        armature = _as_optional_float(armature)
+        friction = _as_optional_float(friction)
+        effort_limit = _as_optional_float(effort_limit)
+        velocity_limit = _as_optional_float(velocity_limit)
 
         dof_control_info = ControlInfo(
             stiffness=stiffness,

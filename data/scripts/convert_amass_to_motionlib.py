@@ -32,6 +32,7 @@ This will create:
 """
 
 import argparse
+import copy
 import os
 import subprocess
 import sys
@@ -181,20 +182,45 @@ Examples:
 
         print(f"\nPackaging {config_name} from {config_path}...")
 
-        # Create a temporary YAML with paths resolved relative to amass_root_dir
-        # Read the original config and update paths to be absolute
+        # Create a temporary YAML next to the packaged .pt file.
+        # motion_lib.py resolves file entries relative to the YAML location, so
+        # keep these paths relative instead of binding them to this workstation.
+        temp_yaml = args.output_dir / f".tmp_{config_name}.yaml"
+        temp_yaml_dir = temp_yaml.parent.resolve()
+
         with open(config_path, "r") as f:
             config = yaml.safe_load(f)
 
-        # Update file paths to be absolute (relative to amass_root_dir)
+        # Keep only motions that were actually converted/found locally, and update
+        # their paths relative to the temporary YAML directory.
+        filtered_motions = []
+        skipped_motions = []
         for motion in config.get("motions", []):
             original_file = motion["file"]
-            # The file paths in the config are relative to amass_root_dir
-            absolute_path = args.amass_root_dir / original_file
-            motion["file"] = str(absolute_path)
+            absolute_path = (args.amass_root_dir / original_file).resolve()
+            if not absolute_path.exists():
+                skipped_motions.append(original_file)
+                continue
+
+            resolved_motion = copy.deepcopy(motion)
+            resolved_motion["file"] = os.path.relpath(absolute_path, start=temp_yaml_dir)
+            filtered_motions.append(resolved_motion)
+
+        config["motions"] = filtered_motions
+
+        print(
+            f"Keeping {len(filtered_motions)}/{len(filtered_motions) + len(skipped_motions)} motions with existing files"
+        )
+        if skipped_motions:
+            print(f"Skipped {len(skipped_motions)} missing motion files")
+        if not filtered_motions:
+            print(
+                f"Error: No existing motion files found for {config_name}. "
+                "Check amass_root_dir or run conversion with available AMASS data first."
+            )
+            sys.exit(1)
 
         # Write updated config to temp file
-        temp_yaml = args.output_dir / f".tmp_{config_name}.yaml"
         with open(temp_yaml, "w") as f:
             yaml.dump(config, f, default_flow_style=False)
 
@@ -212,9 +238,6 @@ Examples:
         print(f"Running: {' '.join(package_cmd)}")
         result = subprocess.run(package_cmd, cwd=project_root, env=env)
 
-        # Clean up temp file
-        temp_yaml.unlink()
-
         if result.returncode != 0:
             print(
                 f"Error: MotionLib packaging for {config_name} failed with return code {result.returncode}"
@@ -222,6 +245,7 @@ Examples:
             sys.exit(result.returncode)
 
         print(f"Created: {output_file}")
+        print(f"Kept temporary config: {temp_yaml}")
 
     # Done
     print("\n" + "=" * 60)
