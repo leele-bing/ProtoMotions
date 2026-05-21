@@ -35,6 +35,7 @@ from protomotions.components.scene_lib import (
     CylinderSceneObject,
 )
 import os
+import sys
 from pathlib import Path
 import numpy as np
 from typing import Dict, List, Any, Optional, Tuple
@@ -160,6 +161,28 @@ class IsaacLabSimulator(Simulator):
         if self._visualization_markers:
             self._build_markers(self._visualization_markers)
         self._sim.reset()
+        self._maybe_create_crowdsim_human_mesh()
+
+    def _maybe_create_crowdsim_human_mesh(self) -> None:
+        """Optionally add the CrowdSim visual-only SMPL surface mesh."""
+        self._crowdsim_human_mesh = None
+        if os.environ.get("CROWDSIM_ENABLE_HUMAN_MESH", "0") != "1":
+            return
+
+        project_root = Path(__file__).resolve().parents[3]
+        if str(project_root) not in sys.path:
+            sys.path.insert(0, str(project_root))
+
+        from CrowdSim.smpl_mesh_visualizer import ProtoMotionsHumanMeshAdapter
+
+        self._crowdsim_human_mesh = ProtoMotionsHumanMeshAdapter.from_simulator(self)
+        self._crowdsim_human_mesh.create()
+        print("[INFO]: CrowdSim human mesh overlay enabled.")
+
+    def _update_crowdsim_human_mesh(self) -> None:
+        visualizer = getattr(self, "_crowdsim_human_mesh", None)
+        if visualizer is not None:
+            visualizer.update()
 
     def _get_scene_cfg(self) -> SceneCfg:
         """
@@ -550,9 +573,10 @@ class IsaacLabSimulator(Simulator):
             self._apply_control()
             self._scene.write_data_to_sim()
             self._sim.step(render=False)
-            if (idx + 1) % self.decimation == 0 and not self.headless:
-                self._sim.render()
             self._scene.update(dt=self._sim.get_physics_dt())
+            if (idx + 1) % self.decimation == 0 and not self.headless:
+                self._update_crowdsim_human_mesh()
+                self._sim.render()
 
     def _apply_simulator_pd_targets(self, pd_targets: torch.Tensor) -> None:
         """Applies PD position targets using IsaacLab's internal PD controller."""

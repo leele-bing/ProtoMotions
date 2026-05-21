@@ -107,6 +107,18 @@ def create_parser():
         help="Path to motion file for inference. If not provided, will use the motion file from the checkpoint.",
     )
     parser.add_argument(
+        "--human-mesh",
+        action="store_true",
+        default=False,
+        help="Show CrowdSim's visual-only SMPL human mesh overlay for IsaacLab inference.",
+    )
+    parser.add_argument(
+        "--hide-humanoid",
+        action="store_true",
+        default=False,
+        help="Hide the original humanoid visual when --human-mesh is enabled.",
+    )
+    parser.add_argument(
         "--scenes-file", type=str, default=None, help="Path to scenes file (optional)"
     )
     parser.add_argument(
@@ -133,6 +145,7 @@ AppLauncher = import_simulator_before_torch(args.simulator)
 
 # Now safe to import everything else including torch
 import logging  # noqa: E402
+import os  # noqa: E402
 from pathlib import Path  # noqa: E402
 import torch  # noqa: E402
 from protomotions.utils.hydra_replacement import get_class  # noqa: E402
@@ -145,6 +158,14 @@ from protomotions.utils.config_utils import clean_dict_for_storage  # noqa: E402
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s: %(message)s")
 
 log = logging.getLogger(__name__)
+
+
+def enable_human_mesh_defaults(hide_humanoid: bool = False) -> None:
+    """Enable CrowdSim's visual-only human mesh overlay."""
+    project_root = Path(__file__).resolve().parents[1]
+    os.environ["CROWDSIM_ENABLE_HUMAN_MESH"] = "1"
+    os.environ.setdefault("CROWDSIM_SMPL_MODEL_DIR", str(project_root / "data" / "smpl"))
+    os.environ["CROWDSIM_HIDE_HUMANOID"] = "1" if hide_humanoid else "0"
 
 
 # def tmp_enable_domain_randomization(robot_cfg, simulator_cfg, env_cfg):
@@ -184,6 +205,12 @@ def main():
     # Re-use the parser and args from module level
     global parser, args
     args = parser.parse_args()
+
+    if args.human_mesh:
+        if args.simulator != "isaaclab":
+            log.warning("--human-mesh is currently implemented for IsaacLab only.")
+        enable_human_mesh_defaults(hide_humanoid=args.hide_humanoid)
+        log.info("Enabled CrowdSim human mesh overlay.")
 
     checkpoint = Path(args.checkpoint)
 
