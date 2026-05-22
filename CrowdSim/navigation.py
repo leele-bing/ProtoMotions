@@ -2,17 +2,202 @@
 
 from __future__ import annotations
 
+import json
 import math
-import random
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import torch
 
+from CrowdSim.nav_task import NavigationTask, NavigationTaskConfig
 from CrowdSim.plan.orca import ORCA
-from CrowdSim.plan.planning import Path_Planner
 from CrowdSim.plan.sfm import Social_Force
+
+
+JETBOT_WHEEL_RADIUS = 0.0325
+JETBOT_WHEEL_BASE = 0.118
+JETBOT_MAX_WHEEL_SPEED = 12.0
+JETBOT_HEADING_GAIN = 2.5
+
+
+class CrowdNavigationMarkers:
+    """Lightweight IsaacLab visual markers for CrowdSim navigation debugging."""
+
+    def __init__(self, device: torch.device, enabled: bool) -> None:
+        self.device = device
+        self.enabled = enabled
+        self.humanoid_start_marker = None
+        self.robot_start_marker = None
+        self.humanoid_path_marker = None
+        self.robot_path_marker = None
+        self.velocity_marker = None
+
+    def create(self, manager: "CrowdNavigationManager") -> None:
+        if not self.enabled:
+            return
+
+        import isaaclab.sim as sim_utils
+        from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+        from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+
+        self.humanoid_start_marker = VisualizationMarkers(
+            VisualizationMarkersCfg(
+                prim_path="/Visuals/CrowdSim/humanoid_starts",
+                markers={
+                    "marker": sim_utils.SphereCfg(
+                        radius=1.0,
+                        visual_material=sim_utils.PreviewSurfaceCfg(
+                            diffuse_color=(0.1, 0.9, 0.2)
+                        ),
+                    )
+                },
+            )
+        )
+        self.robot_start_marker = VisualizationMarkers(
+            VisualizationMarkersCfg(
+                prim_path="/Visuals/CrowdSim/robot_starts",
+                markers={
+                    "marker": sim_utils.SphereCfg(
+                        radius=1.0,
+                        visual_material=sim_utils.PreviewSurfaceCfg(
+                            diffuse_color=(0.0, 0.55, 1.0)
+                        ),
+                    )
+                },
+            )
+        )
+        self.humanoid_path_marker = VisualizationMarkers(
+            VisualizationMarkersCfg(
+                prim_path="/Visuals/CrowdSim/humanoid_paths",
+                markers={
+                    "marker": sim_utils.SphereCfg(
+                        radius=1.0,
+                        visual_material=sim_utils.PreviewSurfaceCfg(
+                            diffuse_color=(0.9, 0.25, 0.1)
+                        ),
+                    )
+                },
+            )
+        )
+        self.robot_path_marker = VisualizationMarkers(
+            VisualizationMarkersCfg(
+                prim_path="/Visuals/CrowdSim/robot_paths",
+                markers={
+                    "marker": sim_utils.SphereCfg(
+                        radius=1.0,
+                        visual_material=sim_utils.PreviewSurfaceCfg(
+                            diffuse_color=(0.0, 0.9, 1.0)
+                        ),
+                    )
+                },
+            )
+        )
+        self.velocity_marker = VisualizationMarkers(
+            VisualizationMarkersCfg(
+                prim_path="/Visuals/CrowdSim/velocity_arrows",
+                markers={
+                    "marker": sim_utils.UsdFileCfg(
+                        usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/arrow_x.usd",
+                        scale=(1.0, 0.1, 0.1),
+                        visual_material=sim_utils.PreviewSurfaceCfg(
+                            diffuse_color=(1.0, 0.85, 0.0),
+                            opacity=0.85,
+                        ),
+                    )
+                },
+            )
+        )
+        self.update_starts(manager.starts_xy, manager.config.num_humanoids)
+        self.update_paths(manager.paths_xy, manager.config.num_humanoids)
+        self.update_velocity(manager.starts_xy, manager.goals_xy - manager.starts_xy, manager)
+
+    def update_starts(self, starts_xy: np.ndarray, num_humanoids: int) -> None:
+        if not self.enabled:
+            return
+
+        humanoid_xy = starts_xy[:num_humanoids]
+        robot_xy = starts_xy[num_humanoids:]
+        self._visualize_spheres(self.humanoid_start_marker, humanoid_xy, z=0.06, scale=0.18)
+        self._visualize_spheres(self.robot_start_marker, robot_xy, z=0.08, scale=0.22)
+
+    def update_paths(self, paths_xy: list[np.ndarray], num_humanoids: int) -> None:
+        if not self.enabled:
+            return
+
+        humanoid_points = self._flatten_paths(paths_xy[:num_humanoids])
+        robot_points = self._flatten_paths(paths_xy[num_humanoids:])
+        self._visualize_spheres(self.humanoid_path_marker, humanoid_points, z=0.035, scale=0.055)
+        self._visualize_spheres(self.robot_path_marker, robot_points, z=0.045, scale=0.065)
+
+    def update_velocity(
+        self,
+        positions_xy: np.ndarray,
+        velocities_xy: np.ndarray,
+        manager: "CrowdNavigationManager",
+    ) -> None:
+        if not self.enabled or self.velocity_marker is None or len(positions_xy) == 0:
+            return
+
+        directions = velocities_xy.copy()
+        speeds = np.linalg.norm(directions, axis=1)
+        for agent_id, speed in enumerate(speeds):
+            if speed > 1e-4:
+                continue
+            fallback = manager._current_waypoint(agent_id) - positions_xy[agent_id]
+            if np.linalg.norm(fallback) <= 1e-4:
+                fallback = manager.goals_xy[agent_id] - positions_xy[agent_id]
+            directions[agent_id] = fallback
+            speeds[agent_id] = np.linalg.norm(fallback)
+
+        yaws = np.arctan2(directions[:, 1], directions[:, 0])
+        translations = np.zeros((len(positions_xy), 3), dtype=np.float32)
+        translations[:, :2] = positions_xy
+        translations[:, 2] = 0.55
+        orientations = self._yaw_to_quat_wxyz(yaws)
+        lengths = np.clip(speeds / max(manager.config.max_speed, 1e-4), 0.25, 1.0)
+        scales = np.column_stack(
+            [0.85 * lengths, 0.12 * np.ones_like(lengths), 0.12 * np.ones_like(lengths)]
+        ).astype(np.float32)
+
+        self.velocity_marker.visualize(
+            translations=translations,
+            orientations=orientations,
+            scales=scales,
+        )
+
+    def _visualize_spheres(self, marker, xy: np.ndarray, z: float, scale: float) -> None:
+        if marker is None or len(xy) == 0:
+            return
+        translations = np.zeros((len(xy), 3), dtype=np.float32)
+        translations[:, :2] = xy
+        translations[:, 2] = z
+        orientations = np.zeros((len(xy), 4), dtype=np.float32)
+        orientations[:, 0] = 1.0
+        scales = np.full((len(xy), 3), scale, dtype=np.float32)
+        marker.visualize(
+            translations=translations,
+            orientations=orientations,
+            scales=scales,
+        )
+
+    @staticmethod
+    def _flatten_paths(paths_xy: list[np.ndarray]) -> np.ndarray:
+        if not paths_xy:
+            return np.zeros((0, 2), dtype=np.float32)
+        non_empty = [path for path in paths_xy if len(path) > 0]
+        if not non_empty:
+            return np.zeros((0, 2), dtype=np.float32)
+        return np.concatenate(non_empty, axis=0).astype(np.float32)
+
+    @staticmethod
+    def _yaw_to_quat_wxyz(yaws: np.ndarray) -> np.ndarray:
+        quats = np.zeros((len(yaws), 4), dtype=np.float32)
+        half_yaws = 0.5 * yaws
+        quats[:, 0] = np.cos(half_yaws)
+        quats[:, 3] = np.sin(half_yaws)
+        return quats
 
 
 @dataclass
@@ -36,12 +221,9 @@ class CrowdNavigationConfig:
     neighbor_radius: float = 4.0
     obstacle_query_radius: int = 14
     max_obstacles: int = 16
-    jetbot_wheel_radius: float = 0.0325
-    jetbot_wheel_base: float = 0.118
-    jetbot_max_wheel_speed: float = 12.0
-    heading_gain: float = 2.5
     collision_distance: float = 0.75
     log_interval: int = 120
+    path_thin_spacing: float = 0.35
 
 
 class CrowdNavigationManager:
@@ -55,21 +237,36 @@ class CrowdNavigationManager:
     def __init__(self, config: CrowdNavigationConfig) -> None:
         self.config = config
         self.num_agents = config.num_humanoids + config.num_robots
-        self.rng = random.Random(config.seed)
+        self.task = NavigationTask(
+            NavigationTaskConfig(
+                map_path=config.map_path,
+                map_resolution=config.map_resolution,
+                free_threshold=config.free_threshold,
+                num_agents=self.num_agents,
+                seed=config.seed,
+                min_start_goal_distance=config.min_start_goal_distance,
+                min_spawn_spacing=config.min_spawn_spacing,
+                path_thin_spacing=config.path_thin_spacing,
+            )
+        )
 
-        self.free_mask, self.obstacle_map = self._load_map(config.map_path)
-        self.height, self.width = self.free_mask.shape
+        self.free_mask = self.task.free_mask
+        self.obstacle_map = self.task.obstacle_map
+        self.height = self.task.height
+        self.width = self.task.width
         self.pixels_per_meter = 1.0 / config.map_resolution
-
-        self.starts_px, self.goals_px = self._sample_start_goal_pixels()
-        self.starts_xy = np.array([self.pixel_to_world(px) for px in self.starts_px], dtype=np.float32)
-        self.goals_xy = np.array([self.pixel_to_world(px) for px in self.goals_px], dtype=np.float32)
-        self.paths_xy = self._plan_paths()
+        self.starts_px = self.task.starts_px
+        self.goals_px = self.task.goals_px
+        self.starts_xy = self.task.starts_xy
+        self.goals_xy = self.task.goals_xy
+        self.paths_xy = self.task.paths_xy
         self.waypoint_ids = np.ones(self.num_agents, dtype=np.int64)
         self.reached = np.zeros(self.num_agents, dtype=bool)
         self.collision_pairs: set[tuple[int, int]] = set()
         self.step_count = 0
         self._last_positions = self.starts_xy.copy()
+        self._markers: CrowdNavigationMarkers | None = None
+        self.path_log_path = self._write_navigation_path_log()
 
         planner_cfg = {
             "map": {"resolution_viz": self.pixels_per_meter},
@@ -118,10 +315,16 @@ class CrowdNavigationManager:
 
         env.step = types.MethodType(step_with_navigation, env)
         env.crowdsim_navigation = self
+        self._markers = CrowdNavigationMarkers(
+            device=self.config.device,
+            enabled=not getattr(env.simulator, "headless", True),
+        )
+        self._markers.create(self)
         print(
             f"[CrowdSim] Navigation enabled: {self.config.num_humanoids} humanoid(s), "
             f"{self.config.num_robots} robot(s), controller={self.config.local_controller}."
         )
+        print(f"[CrowdSim] Navigation path log: {self.path_log_path}")
 
     def pre_step(self) -> None:
         if self.config.num_robots == 0:
@@ -133,10 +336,12 @@ class CrowdNavigationManager:
 
     def post_step(self) -> None:
         self.step_count += 1
-        positions, _ = self._read_agent_state()
-        self._last_positions = positions
+        positions, velocities = self._read_agent_state()
         self._update_waypoints_and_goals(positions)
         new_pairs = self._detect_collisions(positions)
+        if self._markers is not None:
+            self._markers.update_velocity(positions, velocities, self)
+        self._last_positions = positions
         self.env.extras["crowdsim_navigation"] = {
             "reached": int(self.reached.sum()),
             "num_agents": self.num_agents,
@@ -153,78 +358,6 @@ class CrowdNavigationManager:
         if new_pairs:
             print(f"[CrowdSim] Collision warning: {sorted(new_pairs)}")
 
-    def _load_map(self, map_path: Path) -> tuple[np.ndarray, np.ndarray]:
-        try:
-            from PIL import Image
-        except ImportError as exc:
-            raise ImportError("Pillow is required for CrowdSim navigation maps.") from exc
-
-        image = Image.open(map_path).convert("L")
-        grid = np.asarray(image, dtype=np.uint8)
-        free_mask = grid >= int(self.config.free_threshold)
-        obstacle_map = (~free_mask).astype(np.uint8)
-        return free_mask, obstacle_map
-
-    def _sample_start_goal_pixels(self) -> tuple[np.ndarray, np.ndarray]:
-        free_pixels = np.column_stack(np.nonzero(self.free_mask))
-        self.rng.shuffle(free_pixels)
-
-        starts: list[np.ndarray] = []
-        goals: list[np.ndarray] = []
-        min_spacing_px = self.config.min_spawn_spacing / self.config.map_resolution
-        min_goal_px = self.config.min_start_goal_distance / self.config.map_resolution
-
-        for candidate in free_pixels:
-            if len(starts) == self.num_agents:
-                break
-            if starts and min(np.linalg.norm(candidate - np.asarray(p)) for p in starts) < min_spacing_px:
-                continue
-            goal = self._sample_goal_for_start(candidate, min_goal_px)
-            if goal is None:
-                continue
-            starts.append(candidate.copy())
-            goals.append(goal)
-
-        if len(starts) < self.num_agents:
-            raise RuntimeError(
-                f"Only sampled {len(starts)}/{self.num_agents} navigation starts from the map."
-            )
-
-        return np.asarray(starts, dtype=np.int64), np.asarray(goals, dtype=np.int64)
-
-    def _sample_goal_for_start(self, start: np.ndarray, min_goal_px: float) -> np.ndarray | None:
-        ys, xs = np.nonzero(self.free_mask)
-        for _ in range(2000):
-            idx = self.rng.randrange(len(ys))
-            goal = np.array([ys[idx], xs[idx]], dtype=np.int64)
-            if np.linalg.norm(goal - start) >= min_goal_px:
-                return goal
-        return None
-
-    def _plan_paths(self) -> list[np.ndarray]:
-        planner = Path_Planner(self.obstacle_map, smooth=False, viz=False)
-        paths: list[np.ndarray] = []
-        for agent_id, (start, goal) in enumerate(zip(self.starts_px, self.goals_px)):
-            path_px = planner.get_astar_path(start, goal)
-            if path_px is None or len(path_px) == 0:
-                path_xy = np.stack([self.pixel_to_world(start), self.pixel_to_world(goal)], axis=0)
-                print(f"[CrowdSim] Warning: using straight fallback path for agent {agent_id}.")
-            else:
-                path_xy = np.asarray([self.pixel_to_world(px) for px in path_px], dtype=np.float32)
-                path_xy = self._thin_path(path_xy, min_spacing=0.35)
-            paths.append(path_xy)
-        return paths
-
-    def _thin_path(self, path: np.ndarray, min_spacing: float) -> np.ndarray:
-        if len(path) <= 2:
-            return path
-        thinned = [path[0]]
-        for point in path[1:-1]:
-            if np.linalg.norm(point - thinned[-1]) >= min_spacing:
-                thinned.append(point)
-        thinned.append(path[-1])
-        return np.asarray(thinned, dtype=np.float32)
-
     def _initial_robot_yaws(self) -> np.ndarray:
         yaws = np.zeros(self.config.num_robots, dtype=np.float32)
         offset = self.config.num_humanoids
@@ -234,6 +367,49 @@ class CrowdNavigationManager:
                 delta = path[1] - path[0]
                 yaws[idx] = math.atan2(float(delta[1]), float(delta[0]))
         return yaws
+
+    def _write_navigation_path_log(self) -> Path:
+        output_dir = Path("output/crowdsim_navigation")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        latest_path = output_dir / "paths_latest.json"
+        timestamp_path = output_dir / f"paths_{timestamp}.json"
+
+        records = []
+        for agent_id, path in enumerate(self.paths_xy):
+            agent_type = "humanoid" if agent_id < self.config.num_humanoids else "car"
+            local_id = (
+                agent_id
+                if agent_type == "humanoid"
+                else agent_id - self.config.num_humanoids
+            )
+            record = {
+                "agent_id": agent_id,
+                "agent_type": agent_type,
+                "local_id": local_id,
+                "start_xy": self.starts_xy[agent_id].astype(float).tolist(),
+                "goal_xy": self.goals_xy[agent_id].astype(float).tolist(),
+                "path_xy": path.astype(float).tolist(),
+            }
+            records.append(record)
+            print(
+                f"[CrowdSim] path {agent_type}_{local_id}: "
+                f"start={record['start_xy']}, goal={record['goal_xy']}, "
+                f"waypoints={len(record['path_xy'])}"
+            )
+
+        payload = {
+            "created_at": timestamp,
+            "map_path": str(self.config.map_path),
+            "map_resolution": self.config.map_resolution,
+            "num_humanoids": self.config.num_humanoids,
+            "num_cars": self.config.num_robots,
+            "agents": records,
+        }
+        text = json.dumps(payload, indent=2)
+        latest_path.write_text(text, encoding="utf-8")
+        timestamp_path.write_text(text, encoding="utf-8")
+        return latest_path
 
     def _read_agent_state(self) -> tuple[np.ndarray, np.ndarray]:
         humanoid_state = self.env.simulator.get_root_state()
@@ -328,16 +504,18 @@ class CrowdNavigationManager:
 
         forward_speed = float(np.dot(desired_vel, heading))
         lateral_error = float(np.dot(desired_vel, lateral))
-        yaw_rate = self.config.heading_gain * math.atan2(lateral_error, max(abs(forward_speed), 1e-4))
+        yaw_rate = JETBOT_HEADING_GAIN * math.atan2(
+            lateral_error, max(abs(forward_speed), 1e-4)
+        )
 
-        r = self.config.jetbot_wheel_radius
-        b = self.config.jetbot_wheel_base
+        r = JETBOT_WHEEL_RADIUS
+        b = JETBOT_WHEEL_BASE
         left = (forward_speed - 0.5 * b * yaw_rate) / r
         right = (forward_speed + 0.5 * b * yaw_rate) / r
         wheels = np.clip(
             np.array([left, right], dtype=np.float32),
-            -self.config.jetbot_max_wheel_speed,
-            self.config.jetbot_max_wheel_speed,
+            -JETBOT_MAX_WHEEL_SPEED,
+            JETBOT_MAX_WHEEL_SPEED,
         )
         return wheels
 
@@ -386,26 +564,10 @@ class CrowdNavigationManager:
         return path[idx]
 
     def world_to_pixel(self, xy: np.ndarray) -> np.ndarray:
-        center_x = (self.width - 1) * 0.5
-        center_y = (self.height - 1) * 0.5
-        pixel_x = int(round(float(xy[0]) / self.config.map_resolution + center_x))
-        pixel_y = int(round(center_y - float(xy[1]) / self.config.map_resolution))
-        pixel_x = int(np.clip(pixel_x, 0, self.width - 1))
-        pixel_y = int(np.clip(pixel_y, 0, self.height - 1))
-        return np.array([pixel_y, pixel_x], dtype=np.int64)
+        return self.task.world_to_pixel(xy)
 
     def pixel_to_world(self, pixel_yx: np.ndarray) -> np.ndarray:
-        pixel_y = float(pixel_yx[0])
-        pixel_x = float(pixel_yx[1])
-        center_x = (self.width - 1) * 0.5
-        center_y = (self.height - 1) * 0.5
-        return np.array(
-            [
-                (pixel_x - center_x) * self.config.map_resolution,
-                (center_y - pixel_y) * self.config.map_resolution,
-            ],
-            dtype=np.float32,
-        )
+        return self.task.pixel_to_world(pixel_yx)
 
     def _dt(self) -> float:
         return 1.0 / 30.0

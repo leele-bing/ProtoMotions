@@ -10,7 +10,8 @@ import numpy as np
 import torch
 
 
-DEFAULT_OFFICE_MAP_RESOLUTION = 100.0 / 1999.0
+DEFAULT_SCENE_MAP_RESOLUTION = 100.0 / 1999.0
+DEFAULT_OFFICE_MAP_RESOLUTION = DEFAULT_SCENE_MAP_RESOLUTION
 
 
 @dataclass(frozen=True)
@@ -34,7 +35,7 @@ class CrowdRobotSceneConfig:
     lidar_vertical_fov_min: float = 0.0
     lidar_vertical_fov_max: float = 0.0
     lidar_z_offset: float = 0.35
-    lidar_mesh_prim_paths: tuple[str, ...] = ("/World/Office",)
+    lidar_mesh_prim_paths: tuple[str, ...] = ("/World/Scene",)
     debug_vis: bool = False
 
 
@@ -91,7 +92,7 @@ def sample_spawn_xy_from_map(
     map_path: Path,
     num_envs: int,
     device: torch.device,
-    map_resolution: float = DEFAULT_OFFICE_MAP_RESOLUTION,
+    map_resolution: float = DEFAULT_SCENE_MAP_RESOLUTION,
     humanoid_radius: float = 0.45,
     min_spacing: float = 0.9,
     free_threshold: int = 200,
@@ -221,7 +222,7 @@ def _fallback_spawn_grid(
 
 def add_global_usd_reference(
     usd_path: Path,
-    prim_path: str = "/World/Office",
+    prim_path: str = "/World/Scene",
     z_offset: float = 0.0,
 ) -> None:
     import omni.usd
@@ -234,10 +235,11 @@ def add_global_usd_reference(
 
 
 def hide_prims_matching_keywords(
-    root_prim_path: str = "/World/Office",
-    keywords: tuple[str, ...] = ("ceiling", "roof", "top"),
+    root_prim_path: str = "/World/Scene",
+    keywords: tuple[str, ...] = ("ceiling", "cube", "building", "door"),
+    deactivate: bool = False,
 ) -> list[str]:
-    """Hide prims below a root prim when their path contains any keyword."""
+    """Hide or deactivate prims below a root prim when their path contains any keyword."""
     import omni.usd
     from pxr import Usd, UsdGeom
 
@@ -250,13 +252,24 @@ def hide_prims_matching_keywords(
     if not root_prim.IsValid():
         return []
 
-    hidden_paths: list[str] = []
+    matched_paths: list[str] = []
     for prim in Usd.PrimRange(root_prim):
         path = str(prim.GetPath())
         if path == root_prim_path:
             continue
         path_lower = path.lower()
         if any(keyword in path_lower for keyword in normalized_keywords):
+            matched_paths.append(path)
+
+    hidden_paths: list[str] = []
+    for path in matched_paths:
+        prim = stage.GetPrimAtPath(path)
+        if not prim.IsValid():
+            continue
+        if deactivate:
+            prim.SetActive(False)
+            hidden_paths.append(path)
+        else:
             imageable = UsdGeom.Imageable(prim)
             if imageable:
                 imageable.MakeInvisible()
@@ -267,21 +280,24 @@ def hide_prims_matching_keywords(
 def patch_isaaclab_scene_with_global_usd(
     usd_path: Path,
     z_offset: float = 0.0,
-    prim_path: str = "/World/Office",
+    prim_path: str = "/World/Scene",
 ) -> None:
     """Add a global USD asset to IsaacLab SceneCfg before simulator construction."""
     patch_isaaclab_scene_with_crowdsim_assets(
-        office_usd_path=usd_path,
-        office_z_offset=z_offset,
-        office_prim_path=prim_path,
+        scene_usd_path=usd_path,
+        scene_z_offset=z_offset,
+        scene_prim_path=prim_path,
     )
 
 
 def patch_isaaclab_scene_with_crowdsim_assets(
-    office_usd_path: Path | None = None,
-    office_z_offset: float = 0.0,
-    office_prim_path: str = "/World/Office",
+    scene_usd_path: Path | None = None,
+    scene_z_offset: float = 0.0,
+    scene_prim_path: str = "/World/Scene",
     crowd_robot: CrowdRobotSceneConfig | None = None,
+    office_usd_path: Path | None = None,
+    office_z_offset: float | None = None,
+    office_prim_path: str | None = None,
 ) -> None:
     """Add shared CrowdSim assets to IsaacLab SceneCfg before simulator construction."""
     import isaaclab.sim as sim_utils
@@ -291,17 +307,21 @@ def patch_isaaclab_scene_with_crowdsim_assets(
     import protomotions.simulator.isaaclab.simulator as simulator_module
     from protomotions.simulator.isaaclab.utils.scene import SceneCfg as BaseSceneCfg
 
+    usd_path = scene_usd_path if scene_usd_path is not None else office_usd_path
+    z_offset = scene_z_offset if office_z_offset is None else office_z_offset
+    prim_path = scene_prim_path if office_prim_path is None else office_prim_path
+
     class CrowdSimSceneCfg(BaseSceneCfg):
         def __init__(self, *scene_args, **scene_kwargs):
             super().__init__(*scene_args, **scene_kwargs)
-            if office_usd_path is not None:
+            if usd_path is not None:
                 self.global_usd_asset = AssetBaseCfg(
-                    prim_path=office_prim_path,
+                    prim_path=prim_path,
                     spawn=sim_utils.UsdFileCfg(
-                        usd_path=str(office_usd_path),
+                        usd_path=str(usd_path),
                         activate_contact_sensors=False,
                     ),
-                    init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, office_z_offset)),
+                    init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, z_offset)),
                     collision_group=-1,
                 )
 

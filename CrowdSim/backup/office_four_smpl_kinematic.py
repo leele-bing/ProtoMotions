@@ -12,6 +12,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 DEFAULT_OFFICE_MAP_RESOLUTION = 100.0 / 1999.0
+OFFICE_PRIM_HIDE_KEYWORDS = ("ceiling", "cube", "building", "door")
+OFFICE_PRIM_DEACTIVATE_MATCHES = True
+ENABLE_FREE_VIEWER_CAMERA = True
+FREE_VIEWER_CAMERA_EYE = (8.0, -8.0, 6.0)
+FREE_VIEWER_CAMERA_TARGET = (0.0, 0.0, 1.0)
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,12 +51,34 @@ AppLauncher = import_simulator_before_torch("isaaclab")
 
 import torch  # noqa: E402
 
-from CrowdSim.office_scene import (  # noqa: E402
+from CrowdSim.sim_world import (  # noqa: E402
     add_global_usd_reference,
+    hide_prims_matching_keywords,
     parse_spawn_xy,
     resolve_repo_path,
     sample_spawn_xy_from_map,
 )
+
+
+def configure_free_viewer_camera(simulator, headless: bool) -> None:
+    if headless or not ENABLE_FREE_VIEWER_CAMERA:
+        return
+
+    import types
+    import numpy as np
+
+    eye = np.asarray(FREE_VIEWER_CAMERA_EYE, dtype=np.float64)
+    target = np.asarray(FREE_VIEWER_CAMERA_TARGET, dtype=np.float64)
+
+    def init_free_camera(self) -> None:
+        self._cam_prev_char_pos = target.copy()
+        self._perspective_view.set_camera_view(eye, target)
+
+    def keep_user_camera(self) -> None:
+        return
+
+    simulator._init_camera = types.MethodType(init_free_camera, simulator)
+    simulator._update_camera = types.MethodType(keep_user_camera, simulator)
 
 
 def main() -> None:
@@ -94,10 +121,22 @@ def main() -> None:
         device=device,
         simulation_app=app_launcher.app,
     )
+    configure_free_viewer_camera(simulator, args.headless)
     motion_lib = MotionLib(MotionLibConfig(motion_file=str(motion_file)), device=device)
 
     simulator._initialize_with_markers({})
     add_global_usd_reference(office_usd)
+    if OFFICE_PRIM_HIDE_KEYWORDS:
+        hidden_paths = hide_prims_matching_keywords(
+            root_prim_path="/World/Office",
+            keywords=OFFICE_PRIM_HIDE_KEYWORDS,
+            deactivate=OFFICE_PRIM_DEACTIVATE_MATCHES,
+        )
+        action = "Deactivated" if OFFICE_PRIM_DEACTIVATE_MATCHES else "Hidden"
+        print(
+            f"[CrowdSim] {action} {len(hidden_paths)} Office prim(s) "
+            f"matching {OFFICE_PRIM_HIDE_KEYWORDS}."
+        )
 
     env_ids = torch.arange(args.num_envs, dtype=torch.long, device=device)
     motion_ids = env_ids % motion_lib.num_motions()

@@ -1,0 +1,75 @@
+scene:
+  prim_path: /World/Scene
+  z_offset: 0.0
+  scene_usd: ../Assets/Office/office.usd
+  scene_map: ../Assets/Office/office.png
+  resolution: 0.05
+  free_threshold: 200
+  scene_visual:
+    deactivate: true
+    deactivate_keywords: [ceiling, cube, building, door]
+
+
+humanoid:
+  radius: 0.45
+  spawn_xy: null
+  spacing: 0.9
+  spawn_seed: 0
+  human_mesh: false
+  hide_humanoid: false
+  checkpoint: data/pretrained_models/masked_mimic/smpl/last.ckpt
+  motion_file: ../Assets/motion/amass_smpl_test.pt
+
+car:
+  usd: jetbot
+  prim_name: Car
+  articulation_root_prim_path: null
+  mount_prim_path: ""
+  z: 0.0
+  spawn_xy: null
+  radius: 0.35
+  spacing: 1.2
+  spawn_seed: 1
+
+sensors:
+  camera:
+    enabled: false
+    height: 480
+    width: 640
+    record_fps: 10.0
+    record_dir: output/crowdsim_camera
+    record_envs: "0"
+    auto_record: false
+  lidar:
+    enabled: false
+    debug_vis: false
+    horizontal_res: 1.0
+    mesh_prims: [/World/Scene]
+
+
+navigation:
+  enabled: true
+  path:
+    seed: 7
+    path_thin_spacing: 0.35
+    min_start_goal_distance: 5.0
+    min_spawn_spacing: 1.2
+  
+  local_controller: orca
+  agent_radius: 0.35
+  safe_distance: 0.25
+  max_speed: 0.8
+  waypoint_tolerance: 0.45
+  goal_tolerance: 0.75
+  neighbor_radius: 4.0
+  obstacle_query_radius: 14
+  max_obstacles: 16
+  collision_distance: 0.75
+  log_interval: 120
+
+
+
+viewer:
+  camera_mode: free
+  camera_eye: [8.0, -8.0, 6.0]
+  camera_target: [0.0, 0.0, 1.0]

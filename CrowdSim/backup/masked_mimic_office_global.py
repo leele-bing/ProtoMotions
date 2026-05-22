@@ -54,7 +54,7 @@ import os  # noqa: E402
 import torch  # noqa: E402
 from lightning.fabric import Fabric  # noqa: E402
 
-from CrowdSim.office_scene import (  # noqa: E402
+from CrowdSim.sim_world import (  # noqa: E402
     add_global_usd_reference,
     apply_fixed_spawn_offsets,
     parse_spawn_xy,

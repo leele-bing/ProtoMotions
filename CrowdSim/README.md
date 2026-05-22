@@ -5,103 +5,100 @@ visualization experiments in IsaacLab.
 
 ## Scripts
 
-- `office_four_smpl_kinematic.py`: kinematic replay of multiple SMPL humanoids in
-  one shared global Office USD scene.
-- `office_masked_mimic.py`: integrated entry point for Office USD loading,
-  PNG-map spawn sampling, and MaskedMimic policy inference.
-- `masked_mimic_office_global.py`: MaskedMimic inference in one shared global
-  Office USD scene. Kept as the older explicit script.
+- `crowd_sim.py`: config-driven main entry point for USD scene loading, humanoid
+  and Jetbot setup, navigation, sensors, and MaskedMimic inference.
+- `sim_agent.py`: ProtoMotions checkpoint/config loading plus env and agent
+  construction.
+- `sim_world.py`: shared USD scene, spawn, scene patching, and robot scene
+  helpers.
+- `nav_task.py`: map loading, start/goal sampling, and A* path planning.
+- `navigation.py`: Jetbot ORCA/SFM local control and runtime collision checks.
+- `visualize_paths.py`: offline PNG renderer for navigation path JSON logs.
+- `sensor_stream.py`: robot camera recording.
 - `smpl_mesh_visualizer.py`: visual-only SMPL mesh overlay that follows the
   ProtoMotions SMPL robot while keeping the physical humanoid unchanged.
 
 ## Typical Commands
 
 ```bash
-python CrowdSim/office_four_smpl_kinematic.py \
-  --motion-file /home/pcl/amp/Assets/motion/amass_smpl_test.pt \
-  --office-usd /home/pcl/amp/Assets/Office/office.usd
+python CrowdSim/crowd_sim.py --config CrowdSim/config/cfg.yaml
 ```
+
+Scene, agent, sensor, and navigation settings live in
+`CrowdSim/config/cfg.yaml`. Frequently changed runtime settings stay as command
+line arguments:
 
 ```bash
-python CrowdSim/office_masked_mimic.py \
-  --checkpoint results/smpl_amass/last.ckpt \
-  --motion-file /home/pcl/amp/Assets/motion/amass_smpl_test.pt \
-  --office-usd /home/pcl/amp/Assets/Office/office.usd \
-  --office-map /home/pcl/amp/Assets/Office/office.png \
+python CrowdSim/crowd_sim.py \
   --num-envs 4 \
-  --human-mesh
+  --scene-physics
 ```
 
-If `--spawn-xy` is omitted, CrowdSim samples initial humanoid positions from
-`/home/pcl/amp/Assets/Office/office.png`. White pixels are free space, dark/gray
-pixels are obstacles or unknown area, and the image center is world coordinate
-`(0, 0)`. The default map scale assumes the 3999x3999 Isaac Sim occupancy image
-covers stage X/Y bounds `[-100, 100]`. Use `--spawn-xy "x,y;..."` only when you
-want to force manual positions.
+If `humanoid.spawn_xy` is `null`, CrowdSim samples initial humanoid positions
+from `scene.scene_map`. White pixels are free space, dark/gray pixels are
+obstacles or unknown area, and the image center is world coordinate `(0, 0)`.
+The default map scale assumes the 3999x3999 Isaac Sim occupancy image covers
+stage X/Y bounds `[-100, 100]`. For a different USD scene, update
+`scene.scene_usd`, `scene.scene_map`, `scene.prim_path`, and `scene.resolution` in
+`CrowdSim/config/cfg.yaml`.
 
-`office_masked_mimic.py` is the full moving-humanoid entry point: it
-loads the Office USD, samples spawn positions from the PNG map, loads the
+`crowd_sim.py` loads the configured USD scene, samples or parses spawn positions, loads the
 ProtoMotions checkpoint and motion library, then runs the MaskedMimic policy.
-`office_scene.py` only contains shared helper functions.
 
 ### Humanoid + Navigation Robot
 
-`office_masked_mimic.py` can also inject one optional navigation robot per
-humanoid environment. The robot is a separate IsaacLab scene entity named
+`crowd_sim.py` can also inject one optional navigation robot per humanoid
+environment. The robot is a separate IsaacLab scene entity named
 `crowdsim_robot`; enabled sensors are exposed on the env as
 `crowdsim_robot_camera` and `crowdsim_robot_lidar`.
 
 ```bash
-python CrowdSim/office_masked_mimic.py \
-  --checkpoint results/smpl_amass/last.ckpt \
-  --motion-file /home/pcl/amp/Assets/motion/amass_smpl_test.pt \
-  --office-usd /home/pcl/amp/Assets/Office/office.usd \
-  --office-map /home/pcl/amp/Assets/Office/office.png \
-  --num-envs 4 \
-  --robot-usd jetbot \
-  --enable-robot-camera \
-  --enable-robot-lidar
+python CrowdSim/crowd_sim.py --num-envs 4
 ```
 
-Use `--robot-spawn-xy "x,y,yaw;..."` to force robot poses, or omit it to sample
-robot start positions from the same PNG map with `--robot-radius`,
-`--robot-spacing`, and `--robot-spawn-seed`. For a custom USD, replace
-`--robot-usd jetbot` with a local USD path or Omniverse URI. If the sensor
-mount should be below a specific robot prim, pass it with
-`--robot-mount-prim-path base_link`.
+Use `car.spawn_xy: "x,y,yaw;..."` to force car/Jetbot poses, or leave it `null`
+to sample starts from the same PNG map. For a custom USD, set `car.usd` in
+`cfg.yaml` to `jetbot`, a local USD path, or an Omniverse URI. If the sensor
+mount should be below a specific car prim, set `car.mount_prim_path`.
 
 Press `Y` in the viewer to start/stop robot camera recording. By default it
 records env `0` at 10 fps into `output/crowdsim_camera/<timestamp>/`, saving RGB
 PNG files and depth tensors. Use `--robot-camera-record-envs all` to record every
-robot camera, or `--auto-record-robot-camera` to start immediately.
+robot camera, or set `sensors.camera.auto_record: true` to start immediately.
 
-For easier viewing inside closed USD scenes, pass `--hide-office-ceiling` to hide
-Office prims whose paths contain `ceiling`, `roof`, or `top`. Override the
-keywords with `--hide-office-keywords Ceiling Roof`.
+For easier viewing inside closed USD scenes, set `scene.scene_visual.deactivate:
+true`. Any prim whose path matches `scene.scene_visual.deactivate_keywords` is
+deactivated.
 
 ### Navigation Loop
 
-Use `--enable-navigation` to treat humanoids and Jetbots as CrowdSim agents.
-CrowdSim samples random starts/goals in white map pixels, plans one A* path per
-agent, drives Jetbots with ORCA or SFM, leaves humanoids under MaskedMimic
-control, and reports pairwise distance collisions.
+Set `navigation.enabled: true` to treat humanoids and Jetbots as CrowdSim agents.
+CrowdSim samples random starts/goals from the A* traversable white map area,
+plans one A* path per agent, drives Jetbots with ORCA or SFM, leaves humanoids
+under MaskedMimic control, reports pairwise distance collisions, and shows
+navigation debug markers in the viewer. Green spheres are humanoid starts, blue
+spheres are car/Jetbot starts, and yellow arrows show current agent velocity
+direction. If A* cannot find a path, CrowdSim raises an error instead of using a
+straight-line fallback.
 
 ```bash
-python CrowdSim/office_masked_mimic.py \
-  --checkpoint data/pretrained_models/masked_mimic/smpl/last.ckpt \
-  --motion-file /home/pcl/amp/Assets/amass_motion/amass_smpl_test.pt \
-  --office-usd /home/pcl/amp/Assets/Office/office.usd \
-  --office-map /home/pcl/amp/Assets/Office/office.png \
-  --num-envs 4 \
-  --robot-usd jetbot \
-  --enable-navigation \
-  --nav-local-controller orca
+python CrowdSim/crowd_sim.py --num-envs 4 --scene-physics
 ```
 
-With `--num-envs 4 --robot-usd jetbot`, the navigation loop creates 8 logical
-agents: 4 humanoids and 4 Jetbots. Switch the local robot controller with
-`--nav-local-controller sfm`. Collision checks are distance based and controlled
-by `--nav-collision-distance`.
+With `--num-envs 4` and `car.usd: jetbot`, the navigation loop creates 8
+logical agents: 4 humanoids and 4 Jetbots. Switch the local robot controller
+with `navigation.local_controller: sfm`. Collision checks are distance based and
+controlled by `navigation.collision_distance`. A* start/goal sampling and path
+thinning parameters live under `navigation.path`.
+
+CrowdSim disables ProtoMotions projectile cubes by setting the simulator
+projectile pool size to zero during runtime setup.
+
+Render the latest navigation path log on top of the occupancy map:
+
+```bash
+python CrowdSim/visualize_paths.py output/crowdsim_navigation/paths_latest.json
+```
 
 The standard ProtoMotions inference entry also supports the CrowdSim overlay:
 

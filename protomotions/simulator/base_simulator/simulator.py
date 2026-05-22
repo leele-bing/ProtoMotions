@@ -452,6 +452,9 @@ class Simulator(RecordingMixin, ABC):
         3. Lead the target by adding robot XY velocity to launch velocity
         """
         cfg = self._proj_config
+        if cfg.num_projectiles <= 0:
+            return
+
         all_env_ids = torch.arange(self.num_envs, device=self.device)
         cube_idx = self._proj_next_idx.clone()
 

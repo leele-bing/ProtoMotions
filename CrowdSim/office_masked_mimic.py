@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-DEFAULT_OFFICE_MAP_RESOLUTION = 100.0 / 1999.0
+DEFAULT_OFFICE_MAP_RESOLUTION = 0.05
 
 
 def parse_args() -> argparse.Namespace:
@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--checkpoint", default="data/pretrained_models/masked_mimic/smpl/last.ckpt")
-    parser.add_argument("--motion-file", default="../Assets/amass_motion/amass_smpl_test.pt")
+    parser.add_argument("--motion-file", default="../Assets/motion/amass_smpl_test.pt")
     parser.add_argument("--office-usd", default="../Assets/Office/office.usd")
     parser.add_argument("--office-map", default="../Assets/Office/office.png")
     parser.add_argument("--num-envs", type=int, default=4)
@@ -158,7 +158,7 @@ import os  # noqa: E402
 import torch  # noqa: E402
 from lightning.fabric import Fabric  # noqa: E402
 
-from CrowdSim.office_scene import (  # noqa: E402
+from CrowdSim.sim_world import (  # noqa: E402
     CrowdRobotSceneConfig,
     add_global_usd_reference,
     apply_fixed_crowd_robot_spawns,
