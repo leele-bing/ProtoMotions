@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +11,31 @@ import torch
 
 
 DEFAULT_OFFICE_MAP_RESOLUTION = 100.0 / 1999.0
+
+
+@dataclass(frozen=True)
+class CrowdRobotSceneConfig:
+    """Configuration for an optional navigation robot in each ProtoMotions env."""
+
+    usd_path: str
+    prim_name: str = "CrowdRobot"
+    articulation_root_prim_path: str | None = None
+    mount_prim_path: str = ""
+    init_z: float = 0.0
+    enable_camera: bool = False
+    camera_height: int = 480
+    camera_width: int = 640
+    camera_update_period: float = 0.1
+    enable_lidar: bool = False
+    lidar_update_period: float = 1.0 / 20.0
+    lidar_channels: int = 1
+    lidar_horizontal_fov: float = 360.0
+    lidar_horizontal_res: float = 1.0
+    lidar_vertical_fov_min: float = 0.0
+    lidar_vertical_fov_max: float = 0.0
+    lidar_z_offset: float = 0.35
+    lidar_mesh_prim_paths: tuple[str, ...] = ("/World/Office",)
+    debug_vis: bool = False
 
 
 def repo_root() -> Path:
@@ -38,6 +64,27 @@ def parse_spawn_xy(value: str, num_envs: int, device: torch.device) -> torch.Ten
         pairs.append(pairs[len(pairs) % len(pairs)])
 
     return torch.tensor(pairs[:num_envs], dtype=torch.float32, device=device)
+
+
+def parse_spawn_xy_yaw(value: str, num_envs: int, device: torch.device) -> torch.Tensor:
+    """Parse x,y[,yaw] entries separated by semicolons."""
+    poses: list[tuple[float, float, float]] = []
+    for item in value.split(";"):
+        if not item.strip():
+            continue
+        parts = [part.strip() for part in item.split(",")]
+        if len(parts) not in (2, 3):
+            raise ValueError("robot spawn entries must be x,y or x,y,yaw")
+        yaw = float(parts[2]) if len(parts) == 3 else 0.0
+        poses.append((float(parts[0]), float(parts[1]), yaw))
+
+    if not poses:
+        raise ValueError("robot spawn poses must contain at least one x,y[,yaw] entry")
+
+    while len(poses) < num_envs:
+        poses.append(poses[len(poses) % len(poses)])
+
+    return torch.tensor(poses[:num_envs], dtype=torch.float32, device=device)
 
 
 def sample_spawn_xy_from_map(
@@ -178,12 +225,43 @@ def add_global_usd_reference(
     z_offset: float = 0.0,
 ) -> None:
     import omni.usd
-    from pxr import UsdGeom
+    from pxr import Usd, UsdGeom
 
     stage = omni.usd.get_context().get_stage()
     prim = stage.DefinePrim(prim_path, "Xform")
     prim.GetReferences().AddReference(str(usd_path))
     UsdGeom.XformCommonAPI(prim).SetTranslate((0.0, 0.0, z_offset))
+
+
+def hide_prims_matching_keywords(
+    root_prim_path: str = "/World/Office",
+    keywords: tuple[str, ...] = ("ceiling", "roof", "top"),
+) -> list[str]:
+    """Hide prims below a root prim when their path contains any keyword."""
+    import omni.usd
+    from pxr import Usd, UsdGeom
+
+    normalized_keywords = tuple(keyword.lower() for keyword in keywords if keyword)
+    if not normalized_keywords:
+        return []
+
+    stage = omni.usd.get_context().get_stage()
+    root_prim = stage.GetPrimAtPath(root_prim_path)
+    if not root_prim.IsValid():
+        return []
+
+    hidden_paths: list[str] = []
+    for prim in Usd.PrimRange(root_prim):
+        path = str(prim.GetPath())
+        if path == root_prim_path:
+            continue
+        path_lower = path.lower()
+        if any(keyword in path_lower for keyword in normalized_keywords):
+            imageable = UsdGeom.Imageable(prim)
+            if imageable:
+                imageable.MakeInvisible()
+                hidden_paths.append(path)
+    return hidden_paths
 
 
 def patch_isaaclab_scene_with_global_usd(
@@ -192,25 +270,120 @@ def patch_isaaclab_scene_with_global_usd(
     prim_path: str = "/World/Office",
 ) -> None:
     """Add a global USD asset to IsaacLab SceneCfg before simulator construction."""
+    patch_isaaclab_scene_with_crowdsim_assets(
+        office_usd_path=usd_path,
+        office_z_offset=z_offset,
+        office_prim_path=prim_path,
+    )
+
+
+def patch_isaaclab_scene_with_crowdsim_assets(
+    office_usd_path: Path | None = None,
+    office_z_offset: float = 0.0,
+    office_prim_path: str = "/World/Office",
+    crowd_robot: CrowdRobotSceneConfig | None = None,
+) -> None:
+    """Add shared CrowdSim assets to IsaacLab SceneCfg before simulator construction."""
     import isaaclab.sim as sim_utils
-    from isaaclab.assets import AssetBaseCfg
+    from isaaclab.actuators import ImplicitActuatorCfg
+    from isaaclab.assets import ArticulationCfg, AssetBaseCfg
+    from isaaclab.sensors import CameraCfg, RayCasterCfg, patterns
     import protomotions.simulator.isaaclab.simulator as simulator_module
     from protomotions.simulator.isaaclab.utils.scene import SceneCfg as BaseSceneCfg
 
-    class GlobalUsdSceneCfg(BaseSceneCfg):
+    class CrowdSimSceneCfg(BaseSceneCfg):
         def __init__(self, *scene_args, **scene_kwargs):
             super().__init__(*scene_args, **scene_kwargs)
-            self.global_usd_asset = AssetBaseCfg(
-                prim_path=prim_path,
+            if office_usd_path is not None:
+                self.global_usd_asset = AssetBaseCfg(
+                    prim_path=office_prim_path,
+                    spawn=sim_utils.UsdFileCfg(
+                        usd_path=str(office_usd_path),
+                        activate_contact_sensors=False,
+                    ),
+                    init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, office_z_offset)),
+                    collision_group=-1,
+                )
+
+            if crowd_robot is None:
+                return
+
+            robot_prim_path = f"/World/envs/env_.*/{crowd_robot.prim_name}"
+            self.crowdsim_robot = ArticulationCfg(
+                prim_path=robot_prim_path,
                 spawn=sim_utils.UsdFileCfg(
-                    usd_path=str(usd_path),
+                    usd_path=crowd_robot.usd_path,
                     activate_contact_sensors=False,
+                    articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+                        enabled_self_collisions=False
+                    ),
                 ),
-                init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, z_offset)),
-                collision_group=-1,
+                articulation_root_prim_path=crowd_robot.articulation_root_prim_path,
+                init_state=ArticulationCfg.InitialStateCfg(
+                    pos=(0.0, 0.0, crowd_robot.init_z),
+                    joint_pos={".*": 0.0},
+                    joint_vel={".*": 0.0},
+                ),
+                actuators={
+                    "all_joints": ImplicitActuatorCfg(
+                        joint_names_expr=[".*"],
+                        stiffness=None,
+                        damping=None,
+                    )
+                },
             )
 
-    simulator_module.SceneCfg = GlobalUsdSceneCfg
+            sensor_mount_path = _join_prim_path(robot_prim_path, crowd_robot.mount_prim_path)
+            if crowd_robot.enable_camera:
+                self.crowdsim_robot_camera = CameraCfg(
+                    prim_path=f"{sensor_mount_path}/front_cam",
+                    update_period=crowd_robot.camera_update_period,
+                    height=crowd_robot.camera_height,
+                    width=crowd_robot.camera_width,
+                    data_types=["rgb", "distance_to_image_plane"],
+                    spawn=sim_utils.PinholeCameraCfg(
+                        focal_length=24.0,
+                        focus_distance=400.0,
+                        horizontal_aperture=20.955,
+                        clipping_range=(0.1, 100.0),
+                    ),
+                    offset=CameraCfg.OffsetCfg(
+                        pos=(0.25, 0.0, 0.25),
+                        rot=(0.5, -0.5, 0.5, -0.5),
+                        convention="ros",
+                    ),
+                )
+
+            if crowd_robot.enable_lidar:
+                self.crowdsim_robot_lidar = RayCasterCfg(
+                    prim_path=sensor_mount_path,
+                    update_period=crowd_robot.lidar_update_period,
+                    offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, crowd_robot.lidar_z_offset)),
+                    mesh_prim_paths=list(crowd_robot.lidar_mesh_prim_paths),
+                    ray_alignment="yaw",
+                    pattern_cfg=patterns.LidarPatternCfg(
+                        channels=crowd_robot.lidar_channels,
+                        vertical_fov_range=[
+                            crowd_robot.lidar_vertical_fov_min,
+                            crowd_robot.lidar_vertical_fov_max,
+                        ],
+                        horizontal_fov_range=[
+                            -0.5 * crowd_robot.lidar_horizontal_fov,
+                            0.5 * crowd_robot.lidar_horizontal_fov,
+                        ],
+                        horizontal_res=crowd_robot.lidar_horizontal_res,
+                    ),
+                    debug_vis=crowd_robot.debug_vis,
+                )
+
+    simulator_module.SceneCfg = CrowdSimSceneCfg
+
+
+def _join_prim_path(root: str, child: str) -> str:
+    child = child.strip("/")
+    if not child:
+        return root
+    return f"{root}/{child}"
 
 
 def apply_fixed_spawn_offsets(env, spawn_xy: torch.Tensor) -> None:
@@ -227,3 +400,46 @@ def apply_fixed_spawn_offsets(env, spawn_xy: torch.Tensor) -> None:
         update_respawn_root_offset_by_env_ids, env
     )
     env.respawn_root_offset[:] = offsets
+
+
+def apply_fixed_crowd_robot_spawns(
+    env,
+    spawn_xy_yaw: torch.Tensor,
+    scene_key: str = "crowdsim_robot",
+) -> None:
+    """Place optional CrowdSim navigation robots at fixed global XY/yaw poses."""
+    scene = getattr(env.simulator, "_scene", None)
+    if scene is None or scene_key not in scene.keys():
+        raise KeyError(f"Scene entity '{scene_key}' was not created.")
+
+    robot = scene[scene_key]
+    poses = spawn_xy_yaw.to(device=env.device, dtype=torch.float32)
+    if poses.shape[0] != env.num_envs or poses.shape[1] != 3:
+        raise ValueError(
+            f"Expected robot spawn poses with shape ({env.num_envs}, 3), got {tuple(poses.shape)}"
+        )
+
+    root_state = robot.data.default_root_state.clone()
+    root_state[:, 0] = poses[:, 0]
+    root_state[:, 1] = poses[:, 1]
+    root_state[:, 3:7] = _yaw_to_quat_wxyz(poses[:, 2])
+    robot.write_root_pose_to_sim(root_state[:, :7])
+    robot.write_root_velocity_to_sim(torch.zeros_like(root_state[:, 7:]))
+    robot.write_joint_state_to_sim(
+        robot.data.default_joint_pos.clone(),
+        torch.zeros_like(robot.data.default_joint_vel),
+    )
+    scene.reset()
+
+    env.crowdsim_robot = robot
+    for sensor_name in ("crowdsim_robot_camera", "crowdsim_robot_lidar"):
+        if sensor_name in scene.keys():
+            setattr(env, sensor_name, scene[sensor_name])
+
+
+def _yaw_to_quat_wxyz(yaw: torch.Tensor) -> torch.Tensor:
+    quat = torch.zeros((yaw.shape[0], 4), dtype=yaw.dtype, device=yaw.device)
+    half_yaw = 0.5 * yaw
+    quat[:, 0] = torch.cos(half_yaw)
+    quat[:, 3] = torch.sin(half_yaw)
+    return quat
