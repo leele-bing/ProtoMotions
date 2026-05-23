@@ -34,7 +34,6 @@ from CrowdSim.sim_world import (  # noqa: E402
     add_global_usd_reference,
     apply_fixed_crowd_robot_spawns,
     apply_fixed_spawn_offsets,
-    hide_prims_matching_keywords,
     patch_isaaclab_scene_with_crowdsim_assets,
     resolve_repo_path,
 )
@@ -127,7 +126,6 @@ def main() -> None:
 
     if not scene_loaded_in_scene_cfg:
         add_global_usd_reference(scene_usd, prim_path=scene_prim_path, z_offset=scene_z_offset)
-    apply_scene_visual_config(scene_cfg.get("scene_visual", {}), scene_prim_path)
 
     nav_manager = build_navigation_manager(
         scene_map=scene_map,
@@ -468,19 +466,6 @@ def parse_optional_int_pair(value) -> tuple[int, int] | None:
     if len(items) != 2:
         raise ValueError("wheel_joint_indices must be null or a two-item list.")
     return (int(items[0]), int(items[1]))
-
-
-def apply_scene_visual_config(visual_cfg: dict[str, Any], scene_prim_path: str) -> None:
-    if not bool(visual_cfg.get("deactivate", False)):
-        return
-    hidden = hide_prims_matching_keywords(
-        root_prim_path=scene_prim_path,
-        keywords=tuple(
-            visual_cfg.get("deactivate_keywords", ["ceiling", "cube", "building", "door"])
-        ),
-        deactivate=True,
-    )
-    print(f"[CrowdSim] Deactivated {len(hidden)} scene prim(s).")
 
 
 if __name__ == "__main__":

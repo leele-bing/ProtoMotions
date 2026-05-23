@@ -13,6 +13,8 @@ visualization experiments in IsaacLab.
   helpers.
 - `nav_task.py`: map loading, start/goal sampling, and A* path planning.
 - `navigation.py`: Jetbot ORCA/SFM local control and runtime collision checks.
+- `filter_scene_usd.py`: offline USD scene filter that removes or deactivates
+  keyword-matched prims and saves a `*_removed.usd` scene.
 - `train_robot_ppo.py`: PPO training entry point for a learned Jetbot local
   navigation controller.
 - `robot_ppo.py`: small actor-critic PPO implementation used by
@@ -73,9 +75,15 @@ records env `0` at 10 fps into `output/crowdsim_camera/<timestamp>/`, saving RGB
 PNG files and depth tensors. Use `--robot-camera-record-envs all` to record every
 robot camera, or set `sensors.camera.auto_record: true` to start immediately.
 
-For easier viewing inside closed USD scenes, set `scene.scene_visual.deactivate:
-true`. Any prim whose path matches `scene.scene_visual.deactivate_keywords` is
-deactivated.
+Scene filtering is an offline preprocessing step. `crowd_sim.py` and
+`train_robot_ppo.py` do not remove or deactivate scene prims at runtime. To
+create a filtered scene from the configured USD and keywords:
+
+```bash
+python CrowdSim/filter_scene_usd.py --config CrowdSim/config/cfg.yaml
+```
+
+Then point `scene.scene_usd` to the generated `*_removed.usd`.
 
 ### Navigation Loop
 
