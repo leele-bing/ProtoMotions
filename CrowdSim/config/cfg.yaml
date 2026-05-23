@@ -1,13 +1,13 @@
 scene:
   prim_path: /World/Scene
   z_offset: 0.0
-  scene_usd: ../Assets/Office/office.usd
-  scene_map: ../Assets/Office/office.png
+  scene_usd: ../Assets/Hospital/hospital.usd
+  scene_map: ../Assets/Hospital/hospital.png
   resolution: 0.05
   free_threshold: 200
   scene_visual:
     deactivate: true
-    deactivate_keywords: [ceiling, cube, building, door]
+    deactivate_keywords: [ceiling, cube, building, door, roof]
 
 
 humanoid:
@@ -30,6 +30,11 @@ car:
   radius: 0.35
   spacing: 1.2
   spawn_seed: 1
+  wheel_radius: 0.0325
+  wheel_base: 0.118
+  max_wheel_speed: 12.0
+  heading_gain: 2.5
+  wheel_joint_indices: null
 
 sensors:
   camera:
@@ -66,6 +71,21 @@ navigation:
   max_obstacles: 16
   collision_distance: 0.75
   log_interval: 120
+  markers:
+    enabled: false
+    update_interval: 10
+  rl:
+    policy_checkpoint: null
+    deterministic: true
+    num_neighbors: 4
+    num_obstacles: 8
+    obstacle_radius: 4.0
+    action_yaw_rate: 2.5
+    progress_reward_scale: 4.0
+    goal_reward: 10.0
+    collision_penalty: -10.0
+    time_penalty: -0.01
+    max_episode_steps: 600
 
 
 

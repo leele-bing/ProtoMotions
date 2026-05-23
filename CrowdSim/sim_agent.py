@@ -36,10 +36,15 @@ def enable_human_mesh(model_dir: str | None = None, hide_humanoid: bool = False)
 def resolve_robot_usd(value: str | None) -> str | None:
     if value is None:
         return None
-    if value.lower() == "jetbot":
+    robot_name = value.lower()
+    if robot_name == "jetbot":
         from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
         return f"{ISAAC_NUCLEUS_DIR}/Robots/NVIDIA/Jetbot/jetbot.usd"
+    if robot_name in {"nova_carter", "novacarter", "nova-carter"}:
+        from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+
+        return f"{ISAAC_NUCLEUS_DIR}/Robots/NVIDIA/NovaCarter/nova_carter.usd"
     if "://" in value:
         return value
 

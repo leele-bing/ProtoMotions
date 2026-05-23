@@ -16,10 +16,10 @@ from CrowdSim.plan.orca import ORCA
 from CrowdSim.plan.sfm import Social_Force
 
 
-JETBOT_WHEEL_RADIUS = 0.0325
-JETBOT_WHEEL_BASE = 0.118
-JETBOT_MAX_WHEEL_SPEED = 12.0
-JETBOT_HEADING_GAIN = 2.5
+DEFAULT_WHEEL_RADIUS = 0.0325
+DEFAULT_WHEEL_BASE = 0.118
+DEFAULT_MAX_WHEEL_SPEED = 12.0
+DEFAULT_HEADING_GAIN = 2.5
 
 
 class CrowdNavigationMarkers:
@@ -224,6 +224,22 @@ class CrowdNavigationConfig:
     collision_distance: float = 0.75
     log_interval: int = 120
     path_thin_spacing: float = 0.35
+    wheel_radius: float = DEFAULT_WHEEL_RADIUS
+    wheel_base: float = DEFAULT_WHEEL_BASE
+    max_wheel_speed: float = DEFAULT_MAX_WHEEL_SPEED
+    heading_gain: float = DEFAULT_HEADING_GAIN
+    wheel_joint_indices: tuple[int, int] | None = None
+    visual_markers_enabled: bool = False
+    marker_update_interval: int = 10
+    rl_num_neighbors: int = 4
+    rl_num_obstacles: int = 8
+    rl_obstacle_radius: float = 4.0
+    rl_action_yaw_rate: float = 2.5
+    rl_progress_reward_scale: float = 4.0
+    rl_goal_reward: float = 10.0
+    rl_collision_penalty: float = -10.0
+    rl_time_penalty: float = -0.01
+    rl_max_episode_steps: int = 600
 
 
 class CrowdNavigationManager:
@@ -266,6 +282,8 @@ class CrowdNavigationManager:
         self.step_count = 0
         self._last_positions = self.starts_xy.copy()
         self._markers: CrowdNavigationMarkers | None = None
+        self._wheel_targets_tensor: torch.Tensor | None = None
+        self._joint_velocity_targets: torch.Tensor | None = None
         self.path_log_path = self._write_navigation_path_log()
 
         planner_cfg = {
@@ -281,8 +299,18 @@ class CrowdNavigationManager:
             free_uint8 = self.free_mask.astype(np.uint8)
             distance_px = cv2.distanceTransform(free_uint8, cv2.DIST_L2, 5)
             self.local_controller = Social_Force(distance_px * config.map_resolution, planner_cfg)
+        elif config.local_controller == "rl":
+            self.local_controller = None
         else:
             raise ValueError(f"Unsupported local controller: {config.local_controller}")
+
+        self._robot_rl_actions = np.zeros((config.num_robots, 2), dtype=np.float32)
+        self._robot_prev_goal_dist = self._robot_goal_distances(self.starts_xy)
+        self._robot_episode_steps = np.zeros(config.num_robots, dtype=np.int64)
+        self._robot_last_obs: torch.Tensor | None = None
+        self._robot_last_rewards = torch.zeros(config.num_robots, device=config.device)
+        self._robot_last_dones = torch.zeros(config.num_robots, dtype=torch.bool, device=config.device)
+        self._robot_last_info: dict[str, torch.Tensor] = {}
 
     @property
     def humanoid_starts_xy(self) -> torch.Tensor:
@@ -302,6 +330,21 @@ class CrowdNavigationManager:
         self.robot = getattr(env, "crowdsim_robot", None)
         if self.config.num_robots > 0 and self.robot is None:
             raise RuntimeError("Navigation requested robot control, but crowdsim_robot is missing.")
+        if self.config.num_robots > 0:
+            num_joints = self._num_robot_joints()
+            self._wheel_targets_tensor = torch.zeros(
+                self.config.num_robots,
+                2,
+                dtype=torch.float32,
+                device=self.config.device,
+            )
+            if self.config.wheel_joint_indices is None and num_joints != 2:
+                self._joint_velocity_targets = torch.zeros(
+                    self.config.num_robots,
+                    num_joints,
+                    dtype=torch.float32,
+                    device=self.config.device,
+                )
 
         import types
 
@@ -317,7 +360,8 @@ class CrowdNavigationManager:
         env.crowdsim_navigation = self
         self._markers = CrowdNavigationMarkers(
             device=self.config.device,
-            enabled=not getattr(env.simulator, "headless", True),
+            enabled=self.config.visual_markers_enabled
+            and not getattr(env.simulator, "headless", True),
         )
         self._markers.create(self)
         print(
@@ -339,7 +383,12 @@ class CrowdNavigationManager:
         positions, velocities = self._read_agent_state()
         self._update_waypoints_and_goals(positions)
         new_pairs = self._detect_collisions(positions)
-        if self._markers is not None:
+        self._update_robot_rl_feedback(positions, velocities, new_pairs)
+        if (
+            self._markers is not None
+            and self.config.marker_update_interval > 0
+            and self.step_count % self.config.marker_update_interval == 0
+        ):
             self._markers.update_velocity(positions, velocities, self)
         self._last_positions = positions
         self.env.extras["crowdsim_navigation"] = {
@@ -440,9 +489,15 @@ class CrowdNavigationManager:
             pos = positions[agent_id]
             vel = velocities[agent_id]
             goal = self._current_waypoint(agent_id)
+
+            if self.config.local_controller == "rl":
+                wheel_targets[robot_idx] = self._rl_action_to_wheels(
+                    self._robot_rl_actions[robot_idx]
+                )
+                continue
+
             nbr_state = self._neighbor_state(agent_id, positions, velocities)
             cord_int = self.world_to_pixel(pos)
-
             if self.config.local_controller == "orca":
                 obstacles = self._nearby_obstacles_world(pos)
                 desired_vel, _ = self.local_controller.get_action(
@@ -504,34 +559,292 @@ class CrowdNavigationManager:
 
         forward_speed = float(np.dot(desired_vel, heading))
         lateral_error = float(np.dot(desired_vel, lateral))
-        yaw_rate = JETBOT_HEADING_GAIN * math.atan2(
+        yaw_rate = self.config.heading_gain * math.atan2(
             lateral_error, max(abs(forward_speed), 1e-4)
         )
 
-        r = JETBOT_WHEEL_RADIUS
-        b = JETBOT_WHEEL_BASE
+        r = self.config.wheel_radius
+        b = self.config.wheel_base
         left = (forward_speed - 0.5 * b * yaw_rate) / r
         right = (forward_speed + 0.5 * b * yaw_rate) / r
         wheels = np.clip(
             np.array([left, right], dtype=np.float32),
-            -JETBOT_MAX_WHEEL_SPEED,
-            JETBOT_MAX_WHEEL_SPEED,
+            -self.config.max_wheel_speed,
+            self.config.max_wheel_speed,
         )
         return wheels
 
+    def set_robot_rl_actions(self, actions: torch.Tensor | np.ndarray) -> None:
+        """Set normalized RL actions for the next robot control step."""
+        if self.config.local_controller != "rl" or self.config.num_robots == 0:
+            return
+        if isinstance(actions, torch.Tensor):
+            values = actions.detach().cpu().numpy()
+        else:
+            values = np.asarray(actions, dtype=np.float32)
+        if values.shape != (self.config.num_robots, 2):
+            raise ValueError(
+                f"Expected RL robot actions with shape ({self.config.num_robots}, 2), "
+                f"got {values.shape}."
+            )
+        self._robot_rl_actions[:] = np.clip(values, -1.0, 1.0)
+
+    def get_robot_rl_observations(self) -> torch.Tensor:
+        """Return fixed-size observations for the robot navigation PPO policy."""
+        positions, velocities = self._read_agent_state()
+        obs = self._build_robot_rl_observations(positions, velocities)
+        self._robot_last_obs = obs
+        return obs
+
+    def get_robot_rl_feedback(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        """Return next observations, rewards, dones, and diagnostics after env.step()."""
+        if self._robot_last_obs is None:
+            self.get_robot_rl_observations()
+        return (
+            self._robot_last_obs,
+            self._robot_last_rewards,
+            self._robot_last_dones,
+            self._robot_last_info,
+        )
+
+    @property
+    def robot_rl_obs_dim(self) -> int:
+        return 8 + 5 * self.config.rl_num_neighbors + 3 * self.config.rl_num_obstacles
+
+    def reset_robot_rl_episodes(self, done: torch.Tensor | np.ndarray) -> None:
+        """Reset finished robot-only navigation episodes without resetting humanoids."""
+        if self.config.local_controller != "rl" or self.config.num_robots == 0:
+            return
+        if isinstance(done, torch.Tensor):
+            done_np = done.detach().cpu().numpy().astype(bool)
+        else:
+            done_np = np.asarray(done, dtype=bool)
+        robot_ids = np.nonzero(done_np)[0]
+        if len(robot_ids) == 0:
+            return
+
+        agent_offset = self.config.num_humanoids
+        agent_ids = agent_offset + robot_ids
+        yaw = self._initial_robot_yaws()[robot_ids]
+        env_ids = torch.as_tensor(robot_ids, dtype=torch.long, device=self.config.device)
+        poses = self.robot.data.default_root_state[env_ids, :7].clone()
+        poses[:, 0:2] = torch.as_tensor(
+            self.starts_xy[agent_ids], dtype=torch.float32, device=self.config.device
+        )
+        poses[:, 3:7] = self._yaw_to_quat_tensor(torch.as_tensor(yaw, device=self.config.device))
+
+        self.robot.write_root_pose_to_sim(poses, env_ids=env_ids)
+        self.robot.write_root_velocity_to_sim(
+            torch.zeros((len(robot_ids), 6), dtype=torch.float32, device=self.config.device),
+            env_ids=env_ids,
+        )
+        self.robot.write_joint_state_to_sim(
+            self.robot.data.default_joint_pos[env_ids].clone(),
+            torch.zeros_like(self.robot.data.default_joint_vel[env_ids]),
+            env_ids=env_ids,
+        )
+        self.robot.reset(env_ids=env_ids)
+
+        self._robot_rl_actions[robot_ids] = 0.0
+        self.waypoint_ids[agent_ids] = 1
+        self.reached[agent_ids] = False
+        self._robot_episode_steps[robot_ids] = 0
+        self._robot_prev_goal_dist[robot_ids] = np.linalg.norm(
+            self.starts_xy[agent_ids] - self.goals_xy[agent_ids], axis=1
+        )
+        agent_id_set = {int(agent_id) for agent_id in agent_ids}
+        self.collision_pairs = {
+            pair
+            for pair in self.collision_pairs
+            if pair[0] not in agent_id_set and pair[1] not in agent_id_set
+        }
+
+    def _rl_action_to_wheels(self, action: np.ndarray) -> np.ndarray:
+        forward_speed = float(np.clip(action[0], -1.0, 1.0)) * self.config.max_speed
+        yaw_rate = float(np.clip(action[1], -1.0, 1.0)) * self.config.rl_action_yaw_rate
+        left = (forward_speed - 0.5 * self.config.wheel_base * yaw_rate) / self.config.wheel_radius
+        right = (forward_speed + 0.5 * self.config.wheel_base * yaw_rate) / self.config.wheel_radius
+        return np.clip(
+            np.array([left, right], dtype=np.float32),
+            -self.config.max_wheel_speed,
+            self.config.max_wheel_speed,
+        )
+
+    def _update_robot_rl_feedback(
+        self,
+        positions: np.ndarray,
+        velocities: np.ndarray,
+        new_pairs: set[tuple[int, int]],
+    ) -> None:
+        if self.config.local_controller != "rl" or self.config.num_robots == 0:
+            return
+
+        robot_offset = self.config.num_humanoids
+        robot_agent_ids = np.arange(robot_offset, robot_offset + self.config.num_robots)
+        current_dist = np.linalg.norm(positions[robot_agent_ids] - self.goals_xy[robot_agent_ids], axis=1)
+        progress = self._robot_prev_goal_dist - current_dist
+        self._robot_prev_goal_dist = current_dist
+        self._robot_episode_steps += 1
+
+        collision = np.zeros(self.config.num_robots, dtype=bool)
+        for i, j in new_pairs:
+            if robot_offset <= i < robot_offset + self.config.num_robots:
+                collision[i - robot_offset] = True
+            if robot_offset <= j < robot_offset + self.config.num_robots:
+                collision[j - robot_offset] = True
+
+        reached = self.reached[robot_agent_ids].copy()
+        timeout = self._robot_episode_steps >= self.config.rl_max_episode_steps
+        rewards = (
+            self.config.rl_time_penalty
+            + self.config.rl_progress_reward_scale * progress
+            + self.config.rl_goal_reward * reached.astype(np.float32)
+            + self.config.rl_collision_penalty * collision.astype(np.float32)
+        ).astype(np.float32)
+        dones = reached | collision | timeout
+
+        self._robot_last_obs = self._build_robot_rl_observations(positions, velocities)
+        self._robot_last_rewards = torch.as_tensor(rewards, dtype=torch.float32, device=self.config.device)
+        self._robot_last_dones = torch.as_tensor(dones, dtype=torch.bool, device=self.config.device)
+        self._robot_last_info = {
+            "reached": torch.as_tensor(reached, dtype=torch.bool, device=self.config.device),
+            "collision": torch.as_tensor(collision, dtype=torch.bool, device=self.config.device),
+            "timeout": torch.as_tensor(timeout, dtype=torch.bool, device=self.config.device),
+            "distance_to_goal": torch.as_tensor(current_dist, dtype=torch.float32, device=self.config.device),
+        }
+
+    def _build_robot_rl_observations(
+        self,
+        positions: np.ndarray,
+        velocities: np.ndarray,
+    ) -> torch.Tensor:
+        if self.config.num_robots == 0:
+            return torch.zeros((0, self.robot_rl_obs_dim), dtype=torch.float32, device=self.config.device)
+
+        robot_offset = self.config.num_humanoids
+        yaws = self._robot_yaws()
+        obs_rows: list[np.ndarray] = []
+        for robot_idx in range(self.config.num_robots):
+            agent_id = robot_offset + robot_idx
+            pos = positions[agent_id]
+            vel = velocities[agent_id]
+            yaw = yaws[robot_idx]
+
+            waypoint_local = self._world_vec_to_local(self._current_waypoint(agent_id) - pos, yaw)
+            goal_local = self._world_vec_to_local(self.goals_xy[agent_id] - pos, yaw)
+            vel_local = self._world_vec_to_local(vel, yaw)
+            row = [
+                waypoint_local[0] / max(self.config.neighbor_radius, 1e-4),
+                waypoint_local[1] / max(self.config.neighbor_radius, 1e-4),
+                goal_local[0] / max(self.config.min_start_goal_distance, 1e-4),
+                goal_local[1] / max(self.config.min_start_goal_distance, 1e-4),
+                vel_local[0] / max(self.config.max_speed, 1e-4),
+                vel_local[1] / max(self.config.max_speed, 1e-4),
+                math.sin(yaw),
+                math.cos(yaw),
+            ]
+
+            relpos = positions - pos
+            reldis = np.linalg.norm(relpos, axis=1)
+            mask = np.arange(self.num_agents) != agent_id
+            neighbor_ids = np.argsort(np.where(mask, reldis, np.inf))[: self.config.rl_num_neighbors]
+            for neighbor_id in neighbor_ids:
+                if not np.isfinite(reldis[neighbor_id]) or reldis[neighbor_id] > self.config.neighbor_radius:
+                    row.extend([0.0, 0.0, 0.0, 0.0, 0.0])
+                    continue
+                local_rel = self._world_vec_to_local(relpos[neighbor_id], yaw)
+                local_vel = self._world_vec_to_local(velocities[neighbor_id] - vel, yaw)
+                row.extend(
+                    [
+                        local_rel[0] / max(self.config.neighbor_radius, 1e-4),
+                        local_rel[1] / max(self.config.neighbor_radius, 1e-4),
+                        local_vel[0] / max(self.config.max_speed, 1e-4),
+                        local_vel[1] / max(self.config.max_speed, 1e-4),
+                        reldis[neighbor_id] / max(self.config.neighbor_radius, 1e-4),
+                    ]
+                )
+
+            obstacles = self._nearby_obstacles_world(pos)
+            obstacle_rows: list[np.ndarray] = []
+            if obstacles is not None and len(obstacles) > 0:
+                obstacle_rel = obstacles - pos
+                order = np.argsort(np.linalg.norm(obstacle_rel, axis=1))
+                obstacle_rows = [obstacle_rel[idx] for idx in order[: self.config.rl_num_obstacles]]
+            for obstacle_rel in obstacle_rows:
+                local_rel = self._world_vec_to_local(obstacle_rel, yaw)
+                dist = float(np.linalg.norm(obstacle_rel))
+                row.extend(
+                    [
+                        local_rel[0] / max(self.config.rl_obstacle_radius, 1e-4),
+                        local_rel[1] / max(self.config.rl_obstacle_radius, 1e-4),
+                        dist / max(self.config.rl_obstacle_radius, 1e-4),
+                    ]
+                )
+            for _ in range(self.config.rl_num_obstacles - len(obstacle_rows)):
+                row.extend([0.0, 0.0, 0.0])
+
+            obs_rows.append(np.asarray(row, dtype=np.float32))
+
+        obs = np.stack(obs_rows, axis=0)
+        return torch.as_tensor(obs, dtype=torch.float32, device=self.config.device)
+
+    def _robot_goal_distances(self, positions: np.ndarray) -> np.ndarray:
+        if self.config.num_robots == 0:
+            return np.zeros(0, dtype=np.float32)
+        start = self.config.num_humanoids
+        end = start + self.config.num_robots
+        return np.linalg.norm(positions[start:end] - self.goals_xy[start:end], axis=1).astype(np.float32)
+
+    def _robot_yaws(self) -> np.ndarray:
+        if self.config.num_robots == 0:
+            return np.zeros(0, dtype=np.float32)
+        quats = self.robot.data.root_quat_w[: self.config.num_robots].detach().cpu().numpy()
+        return np.asarray([self._yaw_from_quat_wxyz(quat) for quat in quats], dtype=np.float32)
+
+    @staticmethod
+    def _world_vec_to_local(vec: np.ndarray, yaw: float) -> np.ndarray:
+        heading = np.array([math.cos(yaw), math.sin(yaw)], dtype=np.float32)
+        lateral = np.array([-math.sin(yaw), math.cos(yaw)], dtype=np.float32)
+        return np.array([float(np.dot(vec, heading)), float(np.dot(vec, lateral))], dtype=np.float32)
+
     def _write_robot_wheel_targets(self, wheel_targets: np.ndarray) -> None:
-        targets = torch.tensor(wheel_targets, dtype=torch.float32, device=self.config.device)
-        num_joints = getattr(self.robot, "num_joints", targets.shape[1])
-        if num_joints != 2:
-            full_targets = torch.zeros(
-                self.config.num_robots,
-                num_joints,
-                dtype=torch.float32,
+        if self._wheel_targets_tensor is None:
+            return
+
+        targets_cpu = torch.as_tensor(wheel_targets, dtype=torch.float32)
+        self._wheel_targets_tensor.copy_(targets_cpu, non_blocking=True)
+        targets = self._wheel_targets_tensor
+        if self.config.wheel_joint_indices is not None:
+            joint_ids = torch.as_tensor(
+                self.config.wheel_joint_indices,
+                dtype=torch.long,
                 device=self.config.device,
             )
-            full_targets[:, : min(2, num_joints)] = targets[:, : min(2, num_joints)]
-            targets = full_targets
+            self.robot.set_joint_velocity_target(targets, joint_ids=joint_ids)
+            return
+
+        num_joints = self._num_robot_joints()
+        if num_joints != 2:
+            if (
+                self._joint_velocity_targets is None
+                or self._joint_velocity_targets.shape[1] != num_joints
+            ):
+                self._joint_velocity_targets = torch.zeros(
+                    self.config.num_robots,
+                    num_joints,
+                    dtype=torch.float32,
+                    device=self.config.device,
+                )
+            self._joint_velocity_targets.zero_()
+            self._joint_velocity_targets[:, : min(2, num_joints)].copy_(
+                targets[:, : min(2, num_joints)]
+            )
+            targets = self._joint_velocity_targets
         self.robot.set_joint_velocity_target(targets)
+
+    def _num_robot_joints(self) -> int:
+        fallback = self._wheel_targets_tensor.shape[1] if self._wheel_targets_tensor is not None else 2
+        return int(getattr(self.robot, "num_joints", fallback))
 
     def _update_waypoints_and_goals(self, positions: np.ndarray) -> None:
         for agent_id, pos in enumerate(positions):
@@ -578,3 +891,11 @@ class CrowdNavigationManager:
         siny_cosp = 2.0 * (w * z + x * y)
         cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
         return math.atan2(siny_cosp, cosy_cosp)
+
+    @staticmethod
+    def _yaw_to_quat_tensor(yaw: torch.Tensor) -> torch.Tensor:
+        quat = torch.zeros((yaw.shape[0], 4), dtype=yaw.dtype, device=yaw.device)
+        half_yaw = 0.5 * yaw
+        quat[:, 0] = torch.cos(half_yaw)
+        quat[:, 3] = torch.sin(half_yaw)
+        return quat

@@ -13,6 +13,10 @@ visualization experiments in IsaacLab.
   helpers.
 - `nav_task.py`: map loading, start/goal sampling, and A* path planning.
 - `navigation.py`: Jetbot ORCA/SFM local control and runtime collision checks.
+- `train_robot_ppo.py`: PPO training entry point for a learned Jetbot local
+  navigation controller.
+- `robot_ppo.py`: small actor-critic PPO implementation used by
+  `train_robot_ppo.py`.
 - `visualize_paths.py`: offline PNG renderer for navigation path JSON logs.
 - `sensor_stream.py`: robot camera recording.
 - `smpl_mesh_visualizer.py`: visual-only SMPL mesh overlay that follows the
@@ -56,10 +60,13 @@ environment. The robot is a separate IsaacLab scene entity named
 python CrowdSim/crowd_sim.py --num-envs 4
 ```
 
-Use `car.spawn_xy: "x,y,yaw;..."` to force car/Jetbot poses, or leave it `null`
+Use `car.spawn_xy: "x,y,yaw;..."` to force car/robot poses, or leave it `null`
 to sample starts from the same PNG map. For a custom USD, set `car.usd` in
-`cfg.yaml` to `jetbot`, a local USD path, or an Omniverse URI. If the sensor
-mount should be below a specific car prim, set `car.mount_prim_path`.
+`cfg.yaml` to `jetbot`, `nova_carter`, a local USD path, or an Omniverse URI. If
+the sensor mount should be below a specific car prim, set `car.mount_prim_path`.
+For robots whose drive wheels are not the first two joints, set
+`car.wheel_joint_indices` and tune `car.wheel_radius`, `car.wheel_base`, and
+`car.max_wheel_speed`.
 
 Press `Y` in the viewer to start/stop robot camera recording. By default it
 records env `0` at 10 fps into `output/crowdsim_camera/<timestamp>/`, saving RGB
@@ -93,6 +100,40 @@ thinning parameters live under `navigation.path`.
 
 CrowdSim disables ProtoMotions projectile cubes by setting the simulator
 projectile pool size to zero during runtime setup.
+
+### Robot PPO Navigation
+
+`train_robot_ppo.py` trains only the Jetbot local controller. Humanoids still run
+the loaded MaskedMimic policy, while the navigation manager exposes fixed-size
+robot observations, distance/progress rewards, collision penalties, and
+robot-only episode resets.
+
+```bash
+python CrowdSim/train_robot_ppo.py \
+  --config CrowdSim/config/cfg.yaml \
+  --num-envs 8 \
+  --total-steps 200000 \
+  --headless
+```
+
+The script forces `navigation.local_controller: rl` in memory and saves
+checkpoints to `output/crowdsim_robot_ppo/robot_ppo_latest.pt`. It also writes
+CSV metrics to `output/crowdsim_robot_ppo/train_metrics.csv` and TensorBoard
+events to `output/crowdsim_robot_ppo/tb/`. Tune the robot observation and reward
+terms under `navigation.rl` in `cfg.yaml`.
+
+```bash
+tensorboard --logdir output/crowdsim_robot_ppo/tb
+```
+
+To run a trained policy through the normal CrowdSim entry point, set:
+
+```yaml
+navigation:
+  local_controller: rl
+  rl:
+    policy_checkpoint: output/crowdsim_robot_ppo/robot_ppo_latest.pt
+```
 
 Render the latest navigation path log on top of the occupancy map:
 

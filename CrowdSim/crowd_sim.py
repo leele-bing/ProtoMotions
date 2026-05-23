@@ -231,6 +231,8 @@ def main() -> None:
     if args.full_eval:
         runtime.agent.evaluator.eval_count = 0
         print(runtime.agent.evaluator.evaluate())
+    elif nav_manager is not None and nav_manager.config.local_controller == "rl":
+        run_masked_mimic_with_robot_ppo(runtime, nav_manager, config)
     else:
         runtime.agent.evaluator.simple_test_policy(collect_metrics=True)
 
@@ -310,7 +312,10 @@ def build_navigation_manager(
 
     scene_cfg = cfg.get("scene", {})
     humanoid_cfg = cfg.get("humanoid", {})
+    car_cfg = cfg.get("car", {})
     path_cfg = nav_cfg.get("path", {})
+    marker_cfg = nav_cfg.get("markers", {})
+    rl_cfg = nav_cfg.get("rl", {})
     config = CrowdNavigationConfig(
         map_path=scene_map,
         map_resolution=float(scene_cfg.get("resolution", 0.05002501250625312)),
@@ -334,8 +339,35 @@ def build_navigation_manager(
         collision_distance=float(nav_cfg.get("collision_distance", 0.75)),
         log_interval=int(nav_cfg.get("log_interval", 120)),
         path_thin_spacing=float(path_cfg.get("path_thin_spacing", 0.35)),
+        wheel_radius=float(car_cfg.get("wheel_radius", 0.0325)),
+        wheel_base=float(car_cfg.get("wheel_base", 0.118)),
+        max_wheel_speed=float(car_cfg.get("max_wheel_speed", 12.0)),
+        heading_gain=float(car_cfg.get("heading_gain", 2.5)),
+        wheel_joint_indices=parse_optional_int_pair(car_cfg.get("wheel_joint_indices")),
+        visual_markers_enabled=bool(marker_cfg.get("enabled", False)),
+        marker_update_interval=max(1, int(marker_cfg.get("update_interval", 10))),
+        rl_num_neighbors=int(rl_cfg.get("num_neighbors", 4)),
+        rl_num_obstacles=int(rl_cfg.get("num_obstacles", 8)),
+        rl_obstacle_radius=float(rl_cfg.get("obstacle_radius", 4.0)),
+        rl_action_yaw_rate=float(rl_cfg.get("action_yaw_rate", 2.5)),
+        rl_progress_reward_scale=float(rl_cfg.get("progress_reward_scale", 4.0)),
+        rl_goal_reward=float(rl_cfg.get("goal_reward", 10.0)),
+        rl_collision_penalty=float(rl_cfg.get("collision_penalty", -10.0)),
+        rl_time_penalty=float(rl_cfg.get("time_penalty", -0.01)),
+        rl_max_episode_steps=int(rl_cfg.get("max_episode_steps", 600)),
     )
     return CrowdNavigationManager(config)
+
+
+def parse_optional_int_pair(value) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.lower() in {"none", "null", ""}:
+        return None
+    items = list(value)
+    if len(items) != 2:
+        raise ValueError("wheel_joint_indices must be null or a two-item list.")
+    return (int(items[0]), int(items[1]))
 
 
 def apply_scene_visual_config(visual_cfg: dict[str, Any], scene_prim_path: str) -> None:
@@ -350,6 +382,63 @@ def apply_scene_visual_config(visual_cfg: dict[str, Any], scene_prim_path: str) 
         deactivate=True,
     )
     print(f"[CrowdSim] Deactivated {len(hidden)} scene prim(s).")
+
+
+def run_masked_mimic_with_robot_ppo(
+    runtime,
+    nav_manager: CrowdNavigationManager,
+    cfg: dict[str, Any],
+) -> None:
+    rl_cfg = cfg.get("navigation", {}).get("rl", {})
+    checkpoint = rl_cfg.get("policy_checkpoint")
+    if checkpoint is None:
+        raise RuntimeError(
+            "navigation.local_controller is 'rl', but navigation.rl.policy_checkpoint is not set. "
+            "Train a policy with CrowdSim/train_robot_ppo.py first, then point this field at the checkpoint."
+        )
+
+    from CrowdSim.robot_ppo import RobotPPOConfig, RobotPPOTrainer
+
+    ppo = RobotPPOTrainer(
+        RobotPPOConfig(
+            obs_dim=nav_manager.robot_rl_obs_dim,
+            hidden_dim=int(rl_cfg.get("hidden_dim", 128)),
+        ),
+        nav_manager.config.device,
+    )
+    loaded_step = ppo.load(resolve_repo_path(str(checkpoint)))
+    deterministic = bool(rl_cfg.get("deterministic", True))
+    print(f"[CrowdSim] Loaded robot PPO policy from {checkpoint} at robot_step={loaded_step}.")
+
+    agent = runtime.agent
+    env = runtime.env
+    agent.eval()
+    done_indices = None
+    step = 0
+    print("Evaluating MaskedMimic + robot PPO policy... (Ctrl+C to stop)")
+    try:
+        while True:
+            obs, _ = env.reset(done_indices)
+            obs = agent.add_agent_info_to_obs(obs)
+            obs_td = agent.obs_dict_to_tensordict(obs)
+            with torch.no_grad():
+                model_outs = agent.model(obs_td)
+                humanoid_action = model_outs.get("mean_action", model_outs["action"])
+                robot_obs = nav_manager.get_robot_rl_observations()
+                if deterministic:
+                    mean, _, _ = ppo.model(robot_obs)
+                    robot_action = torch.tanh(mean)
+                else:
+                    robot_action, _, _, _ = ppo.act(robot_obs)
+
+            nav_manager.set_robot_rl_actions(robot_action)
+            _, _, dones, _, _ = env.step(humanoid_action)
+            _, _, robot_done, _ = nav_manager.get_robot_rl_feedback()
+            nav_manager.reset_robot_rl_episodes(robot_done)
+            done_indices = dones.nonzero(as_tuple=False).squeeze(-1)
+            step += 1
+    except KeyboardInterrupt:
+        print(f"\nStopped after {step} steps.")
 
 
 if __name__ == "__main__":
