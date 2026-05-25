@@ -20,6 +20,8 @@ visualization experiments in IsaacLab.
 - `robot_ppo.py`: small actor-critic PPO implementation used by
   `train_robot_ppo.py`.
 - `tools/visualize_paths.py`: offline PNG renderer for navigation path JSON logs.
+- `tools/render_navigation_fast.py`: fast PIL/OpenCV renderer for trajectory
+  JSONL logs. It draws directly onto a cropped occupancy map and writes MP4.
 - `sensor_stream.py`: robot camera recording.
 - `smpl_mesh_visualizer.py`: visual-only SMPL mesh overlay that follows the
   ProtoMotions SMPL robot while keeping the physical humanoid unchanged.
@@ -101,10 +103,11 @@ Set `navigation.enabled: true` to treat humanoids and Jetbots as CrowdSim agents
 CrowdSim samples random starts/goals from the A* traversable white map area,
 plans one A* path per agent, drives Jetbots with ORCA or SFM, leaves humanoids
 under MaskedMimic control, reports pairwise distance collisions, and shows
-navigation debug markers in the viewer. Green spheres are humanoid starts, blue
-spheres are car/Jetbot starts, and yellow arrows show current agent velocity
-direction. If A* cannot find a path, CrowdSim raises an error instead of using a
-straight-line fallback.
+navigation debug markers in the viewer. Static markers omit starts: each agent
+gets one color for both its A* path and final goal, humanoids use spheres, and
+cars use cuboids. Dynamic local-target markers use the same per-agent color and
+shape for every agent. If A* cannot find a path, CrowdSim raises an error
+instead of using a straight-line fallback.
 
 ```bash
 python CrowdSim/crowd_sim.py --num-envs 4 --scene-physics
@@ -162,6 +165,25 @@ Render the latest navigation path log on top of the occupancy map:
 ```bash
 python CrowdSim/tools/visualize_paths.py output/crowdsim_navigation/paths_latest.json
 ```
+
+Render the latest trajectory log quickly without Matplotlib:
+
+```bash
+python CrowdSim/tools/render_navigation_fast.py \
+  output/crowdsim_navigation/trajectory_latest.jsonl \
+  --output output/crowdsim_navigation/trajectory_fast.mp4 \
+  --crop-center-pixels 800 \
+  --stride 2
+```
+
+The fast renderer draws SFM debug arrows by default: blue is measured velocity,
+green is raw SFM output velocity, red is static-obstacle repulsion, magenta is
+agent-agent interaction, and white is target-attraction `d_vel`. Use
+`--sfm-arrow-scale` to resize arrows, or `--no-sfm-arrows` to hide them. The
+renderer expects new trajectory logs with SFM debug fields and does not infer
+missing values from older logs. It also shows per-frame humanoid yaw-source
+counts in the status text and labels non-SFM humanoid yaw sources near the
+agent; use `--show-yaw-source-labels` to label every humanoid.
 
 The standard ProtoMotions inference entry also supports the CrowdSim overlay:
 

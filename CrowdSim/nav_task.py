@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import colorsys
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -102,6 +103,8 @@ class NavigationTask:
             if len(starts) == self.config.num_agents:
                 break
             candidate_array = np.asarray(candidate, dtype=np.int64)
+            if not self._is_white_traversable(candidate_array):
+                continue
             if self.component_labels[candidate] == 0:
                 continue
             if starts and min(
@@ -110,6 +113,8 @@ class NavigationTask:
                 continue
             goal = self._sample_goal_for_start(candidate_array, min_goal_px)
             if goal is None:
+                continue
+            if not self._is_white_traversable(goal):
                 continue
             starts.append(candidate_array.copy())
             goals.append(goal)
@@ -153,6 +158,10 @@ class NavigationTask:
             paths.append(path_xy)
         return paths
 
+    def _is_white_traversable(self, pixel_yx: np.ndarray) -> bool:
+        pixel = tuple(int(value) for value in pixel_yx)
+        return bool(self.free_mask[pixel] and self.planner_free_mask[pixel])
+
     def _label_planner_free_space(self) -> tuple[np.ndarray, np.ndarray]:
         num_labels, labels = cv2.connectedComponents(
             self.planner_free_mask.astype(np.uint8), connectivity=8
@@ -172,17 +181,37 @@ class NavigationTask:
         self._markers.create(self, num_humanoids)
 
 
+def agent_marker_color(agent_id: int) -> tuple[float, float, float]:
+    hue = (0.08 + 0.61803398875 * float(agent_id)) % 1.0
+    return tuple(float(value) for value in colorsys.hsv_to_rgb(hue, 0.78, 0.95))
+
+
+def build_agent_marker_prototypes(sim_utils, num_humanoids: int, num_robots: int) -> dict:
+    prototypes = {}
+    total = int(num_humanoids) + int(num_robots)
+    for agent_id in range(total):
+        color = agent_marker_color(agent_id)
+        material = sim_utils.PreviewSurfaceCfg(diffuse_color=color)
+        if agent_id < num_humanoids:
+            prototypes[f"humanoid_{agent_id}"] = sim_utils.SphereCfg(
+                radius=1.0,
+                visual_material=material,
+            )
+        else:
+            robot_id = agent_id - num_humanoids
+            prototypes[f"car_{robot_id}"] = sim_utils.CuboidCfg(
+                size=(1.0, 1.0, 1.0),
+                visual_material=material,
+            )
+    return prototypes
+
+
 class NavigationTaskMarkers:
-    """Static IsaacLab markers for sampled starts, goals, and A* paths."""
+    """Static IsaacLab markers for A* paths and final goals."""
 
     def __init__(self, enabled: bool) -> None:
         self.enabled = enabled
-        self.humanoid_start_marker = None
-        self.car_start_marker = None
-        self.humanoid_goal_marker = None
-        self.car_goal_marker = None
-        self.humanoid_path_marker = None
-        self.car_path_marker = None
+        self.agent_marker = None
 
     def create(self, task: NavigationTask, num_humanoids: int) -> None:
         if not self.enabled:
@@ -191,117 +220,77 @@ class NavigationTaskMarkers:
         import isaaclab.sim as sim_utils
         from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 
-        self.humanoid_start_marker = self._sphere_marker(
-            "/Visuals/CrowdSim/humanoid_starts",
-            sim_utils,
-            color=(0.1, 0.9, 0.2),
-        )
-        self.car_start_marker = self._sphere_marker(
-            "/Visuals/CrowdSim/car_starts",
-            sim_utils,
-            color=(0.0, 0.55, 1.0),
-        )
-        self.humanoid_goal_marker = self._sphere_marker(
-            "/Visuals/CrowdSim/humanoid_goals",
-            sim_utils,
-            color=(1.0, 0.25, 0.1),
-        )
-        self.car_goal_marker = self._sphere_marker(
-            "/Visuals/CrowdSim/car_goals",
-            sim_utils,
-            color=(1.0, 0.8, 0.0),
-        )
-        self.humanoid_path_marker = VisualizationMarkers(
+        self.agent_marker = VisualizationMarkers(
             VisualizationMarkersCfg(
-                prim_path="/Visuals/CrowdSim/humanoid_paths",
-                markers={
-                    "marker": sim_utils.SphereCfg(
-                        radius=1.0,
-                        visual_material=sim_utils.PreviewSurfaceCfg(
-                            diffuse_color=(0.9, 0.25, 0.1)
-                        ),
-                    )
-                },
-            )
-        )
-        self.car_path_marker = VisualizationMarkers(
-            VisualizationMarkersCfg(
-                prim_path="/Visuals/CrowdSim/car_paths",
-                markers={
-                    "marker": sim_utils.SphereCfg(
-                        radius=1.0,
-                        visual_material=sim_utils.PreviewSurfaceCfg(
-                            diffuse_color=(0.0, 0.9, 1.0)
-                        ),
-                    )
-                },
+                prim_path="/Visuals/CrowdSim/nav_paths_and_goals",
+                markers=build_agent_marker_prototypes(
+                    sim_utils,
+                    num_humanoids=num_humanoids,
+                    num_robots=max(0, len(task.paths_xy) - num_humanoids),
+                ),
             )
         )
 
-        humanoid_slice = slice(0, num_humanoids)
-        robot_slice = slice(num_humanoids, None)
-        self._visualize_spheres(
-            self.humanoid_start_marker, task.starts_xy[humanoid_slice], z=0.06, scale=0.18
+        translations, orientations, scales, marker_indices = self._static_marker_arrays(
+            paths_xy=task.paths_xy,
+            goals_xy=task.goals_xy,
+            num_humanoids=num_humanoids,
         )
-        self._visualize_spheres(
-            self.car_start_marker, task.starts_xy[robot_slice], z=0.08, scale=0.22
-        )
-        self._visualize_spheres(
-            self.humanoid_goal_marker, task.goals_xy[humanoid_slice], z=0.06, scale=0.2
-        )
-        self._visualize_spheres(
-            self.car_goal_marker, task.goals_xy[robot_slice], z=0.08, scale=0.24
-        )
-        self._visualize_spheres(
-            self.humanoid_path_marker,
-            self._flatten_paths(task.paths_xy[humanoid_slice]),
-            z=0.035,
-            scale=0.055,
-        )
-        self._visualize_spheres(
-            self.car_path_marker,
-            self._flatten_paths(task.paths_xy[robot_slice]),
-            z=0.045,
-            scale=0.065,
-        )
-
-    @staticmethod
-    def _sphere_marker(prim_path: str, sim_utils, color: tuple[float, float, float]):
-        from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
-
-        return VisualizationMarkers(
-            VisualizationMarkersCfg(
-                prim_path=prim_path,
-                markers={
-                    "marker": sim_utils.SphereCfg(
-                        radius=1.0,
-                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
-                    )
-                },
-            )
-        )
-
-    def _visualize_spheres(self, marker, xy: np.ndarray, z: float, scale: float) -> None:
-        if marker is None or len(xy) == 0:
-            return
-        translations = np.zeros((len(xy), 3), dtype=np.float32)
-        translations[:, :2] = xy
-        translations[:, 2] = z
-        orientations = np.zeros((len(xy), 4), dtype=np.float32)
-        orientations[:, 0] = 1.0
-        scales = np.full((len(xy), 3), scale, dtype=np.float32)
-        marker.visualize(
+        self.agent_marker.visualize(
             translations=translations,
             orientations=orientations,
             scales=scales,
+            marker_indices=marker_indices,
+        )
+
+    def _static_marker_arrays(
+        self,
+        paths_xy: list[np.ndarray],
+        goals_xy: np.ndarray,
+        num_humanoids: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        translations: list[list[float]] = []
+        scales: list[list[float]] = []
+        marker_indices: list[int] = []
+
+        for agent_id, path in enumerate(paths_xy):
+            path_points = path[1:-1] if len(path) > 2 else np.zeros((0, 2), dtype=np.float32)
+            for point in path_points:
+                translations.append([float(point[0]), float(point[1]), 0.04])
+                scales.append(self._path_scale(agent_id, num_humanoids))
+                marker_indices.append(agent_id)
+
+            goal = goals_xy[agent_id]
+            translations.append([float(goal[0]), float(goal[1]), 0.10])
+            scales.append(self._goal_scale(agent_id, num_humanoids))
+            marker_indices.append(agent_id)
+
+        if not translations:
+            return (
+                np.zeros((0, 3), dtype=np.float32),
+                np.zeros((0, 4), dtype=np.float32),
+                np.zeros((0, 3), dtype=np.float32),
+                np.zeros((0,), dtype=np.int32),
+            )
+
+        translations_array = np.asarray(translations, dtype=np.float32)
+        orientations = np.zeros((len(translations_array), 4), dtype=np.float32)
+        orientations[:, 0] = 1.0
+        return (
+            translations_array,
+            orientations,
+            np.asarray(scales, dtype=np.float32),
+            np.asarray(marker_indices, dtype=np.int32),
         )
 
     @staticmethod
-    def _flatten_paths(paths_xy) -> np.ndarray:
-        paths = list(paths_xy)
-        if not paths:
-            return np.zeros((0, 2), dtype=np.float32)
-        non_empty = [path for path in paths if len(path) > 0]
-        if not non_empty:
-            return np.zeros((0, 2), dtype=np.float32)
-        return np.concatenate(non_empty, axis=0).astype(np.float32)
+    def _path_scale(agent_id: int, num_humanoids: int) -> list[float]:
+        if agent_id < num_humanoids:
+            return [0.055, 0.055, 0.055]
+        return [0.075, 0.075, 0.035]
+
+    @staticmethod
+    def _goal_scale(agent_id: int, num_humanoids: int) -> list[float]:
+        if agent_id < num_humanoids:
+            return [0.22, 0.22, 0.22]
+        return [0.26, 0.26, 0.10]

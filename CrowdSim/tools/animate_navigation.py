@@ -1,8 +1,8 @@
 """Animate CrowdSim 2D navigation logs.
 
 The trajectory log is written by CrowdNavigationManager as JSONL. The animation
-shows the occupancy map, planned paths, current agent positions, global goals,
-current A* waypoints, SFM local targets, and car speed traces.
+shows the center-cropped occupancy map, planned paths, current agent positions,
+global goals, current A* waypoints, SFM local targets, and car speed traces.
 """
 
 from __future__ import annotations
@@ -56,6 +56,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stride", type=int, default=1, help="Use every Nth recorded frame.")
     parser.add_argument("--max-frames", type=int, default=0, help="0 means use all frames.")
     parser.add_argument("--trail-length", type=int, default=80)
+    parser.add_argument(
+        "--crop-center-pixels",
+        type=int,
+        default=800,
+        help="Center crop size in map pixels. Use 0 to render the full map.",
+    )
     parser.add_argument("--dpi", type=int, default=120)
     return parser.parse_args()
 
@@ -87,6 +93,7 @@ def main() -> None:
         fps=float(args.fps),
         dpi=int(args.dpi),
         trail_length=max(0, int(args.trail_length)),
+        crop_center_pixels=max(0, int(args.crop_center_pixels)),
     )
     render_speed_plot(
         metadata=metadata,
@@ -122,8 +129,9 @@ def render_animation(
     fps: float,
     dpi: int,
     trail_length: int,
+    crop_center_pixels: int,
 ) -> None:
-    map_image, extent = load_map_image(path_data, metadata)
+    map_image, extent = load_map_image(path_data, metadata, crop_center_pixels)
     num_humanoids = int(path_data.get("num_humanoids", metadata.get("num_humanoids", 0)))
     num_cars = int(path_data.get("num_cars", metadata.get("num_cars", 0)))
     num_agents = num_humanoids + num_cars
@@ -141,6 +149,8 @@ def render_animation(
     ax_map.set_xlabel("world x [m]")
     ax_map.set_ylabel("world y [m]")
     draw_static_paths(ax_map, path_data)
+    ax_map.set_xlim(extent[0], extent[1])
+    ax_map.set_ylim(extent[2], extent[3])
 
     agent_artists = []
     local_target_artists = []
@@ -289,12 +299,13 @@ def car_speed_series(
 
 
 def load_map_image(
-    path_data: dict[str, Any], metadata: dict[str, Any]
+    path_data: dict[str, Any],
+    metadata: dict[str, Any],
+    crop_center_pixels: int,
 ) -> tuple[np.ndarray, tuple[float, float, float, float]]:
     map_path = resolve_path(str(path_data.get("map_path") or metadata["map_path"]))
     image = Image.open(map_path).convert("L")
     image = ImageOps.autocontrast(image)
-    array = np.asarray(image)
 
     resolution = float(path_data.get("map_resolution", metadata["map_resolution"]))
     origin_xy = path_data.get("map_origin_xy", metadata.get("map_origin_xy"))
@@ -303,13 +314,38 @@ def load_map_image(
         origin_xy = [-0.5 * (width - 1) * resolution, -0.5 * (height - 1) * resolution]
     origin_x, origin_y = float(origin_xy[0]), float(origin_xy[1])
     width, height = image.size
-    extent = (
-        origin_x,
-        origin_x + (width - 1) * resolution,
-        origin_y,
-        origin_y + (height - 1) * resolution,
+
+    crop_left, crop_top, crop_right, crop_bottom = centered_crop_box(
+        width=width,
+        height=height,
+        crop_size=crop_center_pixels,
     )
+    if crop_right > crop_left and crop_bottom > crop_top:
+        image = image.crop((crop_left, crop_top, crop_right, crop_bottom))
+
+    extent = (
+        origin_x + crop_left * resolution,
+        origin_x + (crop_right - 1) * resolution,
+        origin_y + (height - crop_bottom) * resolution,
+        origin_y + (height - 1 - crop_top) * resolution,
+    )
+    array = np.asarray(image)
     return array, extent
+
+
+def centered_crop_box(
+    width: int,
+    height: int,
+    crop_size: int,
+) -> tuple[int, int, int, int]:
+    if crop_size <= 0:
+        return 0, 0, width, height
+
+    crop_width = min(width, crop_size)
+    crop_height = min(height, crop_size)
+    left = max(0, (width - crop_width) // 2)
+    top = max(0, (height - crop_height) // 2)
+    return left, top, left + crop_width, top + crop_height
 
 
 def agent_identity(agent_id: int, num_humanoids: int) -> tuple[str, int]:

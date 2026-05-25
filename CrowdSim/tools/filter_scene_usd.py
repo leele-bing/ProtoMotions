@@ -20,8 +20,8 @@ def parse_args() -> argparse.Namespace:
         description="Filter a USD scene using keyword-matched prim paths.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--input-usd", default="/home/pcl/amp/Assets/Office/office.usd")
-    parser.add_argument("--output-usd", default="/home/pcl/amp/Assets/Office/office_removed.usd")
+    parser.add_argument("--input-usd", default="/home/pcl/amp/Assets/Warehouse/warehouse.usd")
+    parser.add_argument("--output-usd", default="/home/pcl/amp/Assets/Warehouse/warehouse_removed.usd")
     parser.add_argument(
         "--root-prim",
         default=None,

@@ -11,7 +11,7 @@ class Social_Force:
         self.rad = cfg['agent']['radius']
         self.max_speed = cfg['agent']['max_vel']      
 
-        self.gain_k = 1
+        self.gain_k = 3
         self.gain_a_static = 4
         self.gain_b_static = 0.25
 
@@ -127,12 +127,7 @@ class Social_Force:
         new_vel = vel + total_d_vel
         # print('[SFM] *** output', np.linalg.norm(d_vel), repulsive_force, interact_force, np.linalg.norm(interaction_vel))
 
-        # clip the speed so that sqrt(vx^2 + vy^2) <= v_pref
-        act_norm = np.linalg.norm(new_vel)
-        if act_norm > self.max_speed:
-            return new_vel*self.max_speed / act_norm, [interact_force, repulsive_force, d_vel]
-        else:
-            return new_vel, [interact_force, repulsive_force, d_vel]
+        return new_vel, [interact_force, repulsive_force, d_vel]
     
     def get_action(self, ego_state, env_obs):
 

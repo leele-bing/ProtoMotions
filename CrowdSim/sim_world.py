@@ -417,16 +417,26 @@ def apply_fixed_spawn_offsets(env, spawn_xy: torch.Tensor) -> None:
     """Pin ProtoMotions respawn offsets to fixed XY positions."""
     import types
 
-    offsets = torch.zeros(env.num_envs, 3, dtype=torch.float32, device=env.device)
-    offsets[:, :2] = spawn_xy
+    desired_root_xy = spawn_xy.to(device=env.device, dtype=torch.float32)
+    if desired_root_xy.shape != (env.num_envs, 2):
+        raise ValueError(
+            f"Expected humanoid spawn XY with shape ({env.num_envs}, 2), "
+            f"got {tuple(desired_root_xy.shape)}"
+        )
 
     def update_respawn_root_offset_by_env_ids(self, env_ids, ref_state=None, sample_flat=False):
-        self.respawn_root_offset[env_ids] = offsets[env_ids]
+        offset = torch.zeros((len(env_ids), 3), dtype=torch.float32, device=self.device)
+        offset[:, :2] = desired_root_xy[env_ids]
+        if ref_state is not None:
+            offset[:, :2] -= ref_state.root_pos[:, :2]
+        offset[:, 2] += self.config.ref_respawn_offset
+        self.respawn_root_offset[env_ids] = offset
 
     env.update_respawn_root_offset_by_env_ids = types.MethodType(
         update_respawn_root_offset_by_env_ids, env
     )
-    env.respawn_root_offset[:] = offsets
+    env.respawn_root_offset[:, :2] = desired_root_xy
+    env.respawn_root_offset[:, 2] = float(env.config.ref_respawn_offset)
 
 
 def apply_fixed_crowd_robot_spawns(

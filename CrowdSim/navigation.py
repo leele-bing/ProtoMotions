@@ -12,7 +12,11 @@ import numpy as np
 import torch
 
 from CrowdSim.differential_control import DifferentialDriveConfig, ManualDifferentialController
-from CrowdSim.nav_task import NavigationTask, NavigationTaskConfig
+from CrowdSim.nav_task import (
+    NavigationTask,
+    NavigationTaskConfig,
+    build_agent_marker_prototypes,
+)
 from CrowdSim.plan.sfm import Social_Force
 from CrowdSim.robot_rl_navigation import RobotRLNavigationMixin
 
@@ -110,10 +114,18 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
         self._robot_sfm_waypoints = self.starts_xy[
             config.num_humanoids : config.num_humanoids + config.num_robots
         ].copy().astype(np.float32)
+        self._sfm_desired_velocities = np.zeros((self.num_agents, 2), dtype=np.float32)
+        self._sfm_interact_forces = np.zeros((self.num_agents, 2), dtype=np.float32)
+        self._sfm_repulsive_forces = np.zeros((self.num_agents, 2), dtype=np.float32)
+        self._sfm_d_vel = np.zeros((self.num_agents, 2), dtype=np.float32)
         self._humanoid_target_yaws = np.zeros(config.num_humanoids, dtype=np.float32)
+        self._humanoid_yaw_source = np.full(
+            config.num_humanoids,
+            "initial",
+            dtype=object,
+        )
         self._printed_masked_mimic_target_warning = False
-        self._humanoid_sfm_target_marker = None
-        self._humanoid_path_target_marker = None
+        self._local_target_marker = None
         self.path_log_path = self._write_navigation_path_log()
         self.trajectory_log_path = self._open_trajectory_log()
 
@@ -171,7 +183,20 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
 
         import types
 
+        original_reset = env.reset
         original_step = env.step
+
+        def reset_with_navigation(env_self, *args, **kwargs):
+            result = original_reset(*args, **kwargs)
+            env_ids = self._reset_env_ids_from_args(args, kwargs)
+            if len(env_ids) > 0:
+                self._reset_navigation_agents(env_ids)
+                positions, velocities = self._read_agent_state()
+                self._compute_sfm_reference_waypoints(positions, velocities)
+                self._update_local_target_markers()
+                self._last_positions = positions
+                self._record_trajectory_frame(positions, velocities)
+            return result
 
         def step_with_navigation(env_self, action):
             should_update_navigation = self._should_update_navigation()
@@ -183,6 +208,7 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
                 self.post_step()
             return result
 
+        env.reset = types.MethodType(reset_with_navigation, env)
         env.step = types.MethodType(step_with_navigation, env)
         env.crowdsim_navigation = self
         self._attach_masked_mimic_navigation_targets(env)
@@ -191,9 +217,8 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
             enabled=self.config.visual_markers_enabled
             and not getattr(env.simulator, "headless", True),
         )
-        self._create_humanoid_target_markers(
+        self._create_local_target_markers(
             enabled=self.config.visual_markers_enabled
-            and self.config.humanoid_target_enabled
             and not getattr(env.simulator, "headless", True)
         )
         print(
@@ -218,6 +243,7 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
     def pre_step(self) -> None:
         positions, velocities = self._read_agent_state()
         self._compute_sfm_reference_waypoints(positions, velocities)
+        self._update_local_target_markers()
 
         if self.config.num_robots == 0:
             return
@@ -368,6 +394,11 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
             "velocities_xy": velocities.astype(float).tolist(),
             "current_waypoints_xy": current_waypoints.astype(float).tolist(),
             "local_targets_xy": self._sfm_waypoints.astype(float).tolist(),
+            "sfm_desired_velocities_xy": self._sfm_desired_velocities.astype(float).tolist(),
+            "sfm_interact_forces_xy": self._sfm_interact_forces.astype(float).tolist(),
+            "sfm_repulsive_forces_xy": self._sfm_repulsive_forces.astype(float).tolist(),
+            "sfm_d_vel_xy": self._sfm_d_vel.astype(float).tolist(),
+            "humanoid_yaw_source": self._humanoid_yaw_source.astype(str).tolist(),
             "reached": self.reached.astype(bool).tolist(),
             "collision_pairs": [list(pair) for pair in sorted(self.collision_pairs)],
         }
@@ -425,6 +456,10 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
     ) -> None:
         self._sfm_waypoints[: self.num_agents] = positions[: self.num_agents]
         target_timestep = max(float(self.config.local_target_timestep), 1e-5)
+        self._sfm_desired_velocities.fill(0.0)
+        self._sfm_interact_forces.fill(0.0)
+        self._sfm_repulsive_forces.fill(0.0)
+        self._sfm_d_vel.fill(0.0)
         if self.config.num_humanoids > 0:
             self._humanoid_sfm_waypoints[:] = positions[: self.config.num_humanoids]
         if self.config.num_robots > 0:
@@ -434,6 +469,8 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
 
         for agent_id in range(self.num_agents):
             if self.reached[agent_id]:
+                if agent_id < self.config.num_humanoids:
+                    self._humanoid_yaw_source[agent_id] = "reached"
                 continue
 
             pos = positions[agent_id]
@@ -441,11 +478,17 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
             goal = self._current_waypoint(agent_id)
             nbr_state = self._neighbor_state(agent_id, positions, velocities)
             cord_int = self._clip_pixel_yx(self.world_to_pixel(pos))
-            desired_vel, _ = self.sfm_controller.get_action(
+            desired_vel, force_terms = self.sfm_controller.get_action(
                 (pos, cord_int, vel, goal),
                 (nbr_state[0], nbr_state[1], nbr_state[2]),
             )
-            desired_vel = self._clip_desired_velocity(np.asarray(desired_vel, dtype=np.float32))
+            desired_vel = np.asarray(desired_vel, dtype=np.float32)
+            if not np.all(np.isfinite(desired_vel)):
+                desired_vel = np.zeros(2, dtype=np.float32)
+            self._sfm_desired_velocities[agent_id] = desired_vel
+            self._sfm_interact_forces[agent_id] = np.asarray(force_terms[0], dtype=np.float32)
+            self._sfm_repulsive_forces[agent_id] = np.asarray(force_terms[1], dtype=np.float32)
+            self._sfm_d_vel[agent_id] = np.asarray(force_terms[2], dtype=np.float32)
             sfm_waypoint = (pos + desired_vel * target_timestep).astype(np.float32)
             self._sfm_waypoints[agent_id] = sfm_waypoint
 
@@ -461,12 +504,16 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
                 self._humanoid_target_yaws[agent_id] = math.atan2(
                     float(heading_delta[1]), float(heading_delta[0])
                 )
+                self._humanoid_yaw_source[agent_id] = "sfm_target"
             else:
                 fallback = self._waypoint_desired_velocity(pos, goal)
                 if np.linalg.norm(fallback) >= 1e-5:
                     self._humanoid_target_yaws[agent_id] = math.atan2(
                         float(fallback[1]), float(fallback[0])
                     )
+                    self._humanoid_yaw_source[agent_id] = "waypoint_fallback"
+                else:
+                    self._humanoid_yaw_source[agent_id] = "previous"
 
     def _attach_masked_mimic_navigation_targets(self, env) -> None:
         if not self.config.humanoid_target_enabled or self.config.num_humanoids == 0:
@@ -532,10 +579,6 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
             current_pelvis[:, :2].detach().cpu().numpy(),
             offsets_np,
         )
-        self._update_humanoid_target_markers(
-            xy_targets_np,
-            current_pelvis[:, 2].detach().cpu().numpy(),
-        )
         xy_targets = torch.as_tensor(xy_targets_np, dtype=dtype, device=device)
         yaws = torch.as_tensor(target_yaws_np, dtype=dtype, device=device)
         active = torch.as_tensor(
@@ -586,77 +629,62 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
         self._printed_masked_mimic_target_warning = True
         print(f"[CrowdSim] Humanoid navigation targets disabled for this run: {reason}")
 
-    def _create_humanoid_target_markers(self, enabled: bool) -> None:
+    def _create_local_target_markers(self, enabled: bool) -> None:
         if not enabled:
             return
 
         import isaaclab.sim as sim_utils
         from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 
-        self._humanoid_sfm_target_marker = VisualizationMarkers(
+        self._local_target_marker = VisualizationMarkers(
             VisualizationMarkersCfg(
-                prim_path="/Visuals/CrowdSim/humanoid_sfm_targets",
-                markers={
-                    "marker": sim_utils.SphereCfg(
-                        radius=1.0,
-                        visual_material=sim_utils.PreviewSurfaceCfg(
-                            diffuse_color=(1.0, 0.15, 0.95)
-                        ),
-                    )
-                },
-            )
-        )
-        self._humanoid_path_target_marker = VisualizationMarkers(
-            VisualizationMarkersCfg(
-                prim_path="/Visuals/CrowdSim/humanoid_path_targets",
-                markers={
-                    "marker": sim_utils.SphereCfg(
-                        radius=1.0,
-                        visual_material=sim_utils.PreviewSurfaceCfg(
-                            diffuse_color=(0.95, 0.95, 1.0)
-                        ),
-                    )
-                },
+                prim_path="/Visuals/CrowdSim/local_targets",
+                markers=build_agent_marker_prototypes(
+                    sim_utils,
+                    num_humanoids=self.config.num_humanoids,
+                    num_robots=self.config.num_robots,
+                ),
             )
         )
 
-    def _update_humanoid_target_markers(self, targets_xy: np.ndarray, pelvis_z: np.ndarray) -> None:
-        if self._humanoid_sfm_target_marker is None and self._humanoid_path_target_marker is None:
+    def _update_local_target_markers(self) -> None:
+        if self._local_target_marker is None or self.num_agents == 0:
             return
-        if targets_xy.size == 0:
-            return
-
-        sfm_steps = min(1, targets_xy.shape[1])
-        self._visualize_target_slots(
-            self._humanoid_sfm_target_marker,
-            targets_xy[:, :sfm_steps, :],
-            pelvis_z,
-            scale=0.16,
-        )
-        self._visualize_target_slots(
-            self._humanoid_path_target_marker,
-            targets_xy[:, sfm_steps:, :],
-            pelvis_z,
-            scale=0.11,
-        )
-
-    @staticmethod
-    def _visualize_target_slots(marker, targets_xy: np.ndarray, pelvis_z: np.ndarray, scale: float) -> None:
-        if marker is None or targets_xy.size == 0:
-            return
-
-        num_agents, num_steps = targets_xy.shape[:2]
-        translations = np.zeros((num_agents * num_steps, 3), dtype=np.float32)
-        translations[:, :2] = targets_xy.reshape(-1, 2)
-        translations[:, 2] = np.repeat(pelvis_z.astype(np.float32), num_steps)
-        orientations = np.zeros((len(translations), 4), dtype=np.float32)
+        translations = np.zeros((self.num_agents, 3), dtype=np.float32)
+        translations[:, :2] = self._sfm_waypoints[: self.num_agents]
+        translations[:, 2] = self._agent_root_heights()
+        orientations = np.zeros((self.num_agents, 4), dtype=np.float32)
         orientations[:, 0] = 1.0
-        scales = np.full((len(translations), 3), scale, dtype=np.float32)
-        marker.visualize(
+        scales = np.asarray(
+            [
+                [0.16, 0.16, 0.16]
+                if agent_id < self.config.num_humanoids
+                else [0.20, 0.20, 0.08]
+                for agent_id in range(self.num_agents)
+            ],
+            dtype=np.float32,
+        )
+        marker_indices = np.arange(self.num_agents, dtype=np.int32)
+        self._local_target_marker.visualize(
             translations=translations,
             orientations=orientations,
             scales=scales,
+            marker_indices=marker_indices,
         )
+
+    def _agent_root_heights(self) -> np.ndarray:
+        heights = np.full(self.num_agents, 0.16, dtype=np.float32)
+        if self.config.num_humanoids > 0:
+            humanoid_state = self.env.simulator.get_root_state()
+            heights[: self.config.num_humanoids] = (
+                humanoid_state.root_pos[:, 2].detach().cpu().numpy().astype(np.float32)
+            )
+        if self.config.num_robots > 0 and self.robot is not None:
+            start = self.config.num_humanoids
+            heights[start : start + self.config.num_robots] = (
+                self.robot.data.root_pos_w[:, 2].detach().cpu().numpy().astype(np.float32)
+            )
+        return heights
 
     def _neighbor_state(
         self, agent_id: int, positions: np.ndarray, velocities: np.ndarray
@@ -737,6 +765,46 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
                     self.collision_pairs.add(pair)
         return new_pairs
 
+    def _reset_env_ids_from_args(self, args: tuple, kwargs: dict) -> np.ndarray:
+        if "env_ids" in kwargs:
+            env_ids = kwargs["env_ids"]
+            if env_ids is None:
+                return np.arange(self.config.num_humanoids, dtype=np.int64)
+            if isinstance(env_ids, torch.Tensor):
+                return np.atleast_1d(
+                    env_ids.detach().cpu().numpy().astype(np.int64, copy=False)
+                )
+            return np.atleast_1d(np.asarray(env_ids, dtype=np.int64))
+
+        if not args or args[0] is None:
+            return np.arange(self.config.num_humanoids, dtype=np.int64)
+
+        env_ids = args[0]
+        if isinstance(env_ids, torch.Tensor):
+            return np.atleast_1d(
+                env_ids.detach().cpu().numpy().astype(np.int64, copy=False)
+            )
+        return np.atleast_1d(np.asarray(env_ids, dtype=np.int64))
+
+    def _reset_navigation_agents(self, env_ids: np.ndarray) -> None:
+        if len(env_ids) == 0:
+            return
+
+        humanoid_ids = env_ids[
+            (0 <= env_ids) & (env_ids < self.config.num_humanoids)
+        ]
+        if len(humanoid_ids) > 0:
+            self.waypoint_ids[humanoid_ids] = 1
+            self.reached[humanoid_ids] = False
+            self._humanoid_yaw_source[humanoid_ids] = "reset"
+
+        if self.config.num_robots > 0:
+            robot_agent_ids = self.config.num_humanoids + humanoid_ids
+            robot_agent_ids = robot_agent_ids[robot_agent_ids < self.num_agents]
+            if len(robot_agent_ids) > 0:
+                self.waypoint_ids[robot_agent_ids] = 1
+                self.reached[robot_agent_ids] = False
+
     def _current_waypoint(self, agent_id: int) -> np.ndarray:
         path = self.paths_xy[agent_id]
         idx = min(int(self.waypoint_ids[agent_id]), len(path) - 1)
@@ -777,14 +845,6 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
             return np.zeros(2, dtype=np.float32)
         speed = min(self.config.max_speed, distance / max(self._dt(), 1e-5))
         return (delta / distance * speed).astype(np.float32)
-
-    def _clip_desired_velocity(self, desired_vel: np.ndarray) -> np.ndarray:
-        if not np.all(np.isfinite(desired_vel)):
-            return np.zeros(2, dtype=np.float32)
-        speed = float(np.linalg.norm(desired_vel))
-        if speed <= self.config.max_speed:
-            return desired_vel.astype(np.float32)
-        return (desired_vel * (self.config.max_speed / max(speed, 1e-5))).astype(np.float32)
 
     def _clip_pixel_yx(self, pixel_yx: np.ndarray) -> np.ndarray:
         return np.array(
