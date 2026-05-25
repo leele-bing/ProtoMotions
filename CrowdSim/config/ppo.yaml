@@ -1,0 +1,23 @@
+rl:
+  policy_checkpoint: null
+  deterministic: true
+  num_neighbors: 4
+  num_obstacles: 8
+  obstacle_radius: 4.0
+  progress_reward_scale: 4.0
+  goal_reward: 10.0
+  collision_penalty: -10.0
+  time_penalty: -0.01
+  max_episode_steps: 600
+
+network:
+  hidden_dim: 128
+
+training:
+  total_steps: 200000
+  rollout_steps: 256
+  ppo_epochs: 4
+  minibatch_size: 256
+  lr: 0.0003
+  save_interval: 20000
+  output_dir: output/crowdsim_robot_ppo

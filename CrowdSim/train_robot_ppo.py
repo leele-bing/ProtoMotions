@@ -18,9 +18,14 @@ AppLauncher = import_simulator_before_torch("isaaclab")
 
 import torch  # noqa: E402
 
+from CrowdSim.utils.humanoid_state_recorder import (  # noqa: E402
+    HumanoidStateRecorderConfig,
+    configure_humanoid_state_recorder,
+)
+from CrowdSim.utils.map_metadata import OccupancyMapMetadata, load_occupancy_map_metadata  # noqa: E402
 from CrowdSim.navigation import CrowdNavigationConfig, CrowdNavigationManager  # noqa: E402
 from CrowdSim.robot_ppo import RobotPPOConfig, RobotPPOTrainer, RobotRolloutBuffer  # noqa: E402
-from CrowdSim.sensor_stream import RobotCameraStreamConfig, configure_robot_camera_recorder  # noqa: E402
+from CrowdSim.utils.sensor_stream import RobotCameraStreamConfig, configure_robot_camera_recorder  # noqa: E402
 from CrowdSim.sim_agent import (  # noqa: E402
     build_runtime,
     configure_viewer_camera,
@@ -44,19 +49,25 @@ def parse_args() -> argparse.Namespace:
         description="Train a PPO local navigation policy for CrowdSim robots.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--config", default="CrowdSim/config/cfg.yaml")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Environment config path. Kept as a compatibility alias for --env-config.",
+    )
+    parser.add_argument("--env-config", default="CrowdSim/config/env.yaml")
+    parser.add_argument("--ppo-config", default="CrowdSim/config/ppo.yaml")
     parser.add_argument("--num-envs", type=int, default=8)
     parser.add_argument("--headless", action="store_true", default=True)
     parser.add_argument("--render", action="store_true", help="Run with viewer instead of headless.")
     parser.add_argument("--scene-physics", action="store_true")
-    parser.add_argument("--total-steps", type=int, default=200_000)
-    parser.add_argument("--rollout-steps", type=int, default=256)
-    parser.add_argument("--ppo-epochs", type=int, default=4)
-    parser.add_argument("--minibatch-size", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=3.0e-4)
-    parser.add_argument("--hidden-dim", type=int, default=128)
-    parser.add_argument("--save-interval", type=int, default=20_000)
-    parser.add_argument("--output-dir", default="output/crowdsim_robot_ppo")
+    parser.add_argument("--total-steps", type=int, default=None)
+    parser.add_argument("--rollout-steps", type=int, default=None)
+    parser.add_argument("--ppo-epochs", type=int, default=None)
+    parser.add_argument("--minibatch-size", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--hidden-dim", type=int, default=None)
+    parser.add_argument("--save-interval", type=int, default=None)
+    parser.add_argument("--output-dir", default=None)
     parser.add_argument("--resume", default=None)
     parser.add_argument("--no-tensorboard", action="store_true")
     return parser.parse_args()
@@ -64,9 +75,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    config = load_config(cfg_path(args.config))
+    config = load_config(cfg_path(args.config or args.env_config))
+    ppo_config_path = cfg_path(args.ppo_config)
+    ppo_config = load_config(ppo_config_path) if ppo_config_path.exists() else {}
+    merge_ppo_config(config, ppo_config)
     config.setdefault("navigation", {})["enabled"] = True
-    config["navigation"]["local_controller"] = "rl"
+    config["navigation"].setdefault("local", {})["method"] = "rl"
+    config["navigation"]["local"]["method"] = "rl"
+    training_cfg = get_config_section(ppo_config, "training")
+    network_cfg = get_config_section(ppo_config, "network")
 
     scene_cfg = config.get("scene", {})
     humanoid_cfg = config.get("humanoid", {})
@@ -76,13 +93,14 @@ def main() -> None:
     checkpoint = resolve_repo_path(humanoid_cfg["checkpoint"])
     motion_file = resolve_repo_path(humanoid_cfg["motion_file"])
     scene_usd = resolve_repo_path(scene_cfg["scene_usd"])
-    scene_map = resolve_repo_path(scene_cfg["scene_map"])
+    scene_map_ref = resolve_repo_path(scene_cfg["scene_map"])
+    map_metadata = load_occupancy_map_metadata(scene_map_ref)
     validate_paths(
         {
             "Checkpoint": checkpoint,
             "Motion file": motion_file,
             "Scene USD": scene_usd,
-            "Scene map": scene_map,
+            "Scene map image": map_metadata.image_path,
         }
     )
 
@@ -123,12 +141,13 @@ def main() -> None:
     )
     env = runtime.env
     configure_viewer_camera(env, config.get("viewer", {}), headless)
+    configure_humanoid_state_recording(env, config)
 
     if not scene_loaded_in_scene_cfg:
         add_global_usd_reference(scene_usd, prim_path=scene_prim_path, z_offset=scene_z_offset)
 
     nav_manager = build_navigation_manager(
-        scene_map=scene_map,
+        map_metadata=map_metadata,
         num_humanoids=env.num_envs,
         num_robots=env.num_envs,
         device=fabric.device,
@@ -154,10 +173,10 @@ def main() -> None:
 
     ppo_cfg = RobotPPOConfig(
         obs_dim=nav_manager.robot_rl_obs_dim,
-        hidden_dim=args.hidden_dim,
-        lr=args.lr,
-        ppo_epochs=args.ppo_epochs,
-        minibatch_size=args.minibatch_size,
+        hidden_dim=int(config_value(args.hidden_dim, network_cfg, "hidden_dim", 128)),
+        lr=float(config_value(args.lr, training_cfg, "lr", 3.0e-4)),
+        ppo_epochs=int(config_value(args.ppo_epochs, training_cfg, "ppo_epochs", 4)),
+        minibatch_size=int(config_value(args.minibatch_size, training_cfg, "minibatch_size", 256)),
     )
     ppo = RobotPPOTrainer(ppo_cfg, fabric.device)
     start_step = 0
@@ -166,7 +185,7 @@ def main() -> None:
         print(f"[CrowdSim][PPO] Resumed from {args.resume} at robot_step={start_step}.")
 
     buffer = RobotRolloutBuffer(
-        rollout_steps=args.rollout_steps,
+        rollout_steps=int(config_value(args.rollout_steps, training_cfg, "rollout_steps", 256)),
         num_envs=nav_manager.config.num_robots,
         obs_dim=nav_manager.robot_rl_obs_dim,
         action_dim=2,
@@ -177,10 +196,10 @@ def main() -> None:
         nav_manager=nav_manager,
         ppo=ppo,
         buffer=buffer,
-        total_steps=args.total_steps,
+        total_steps=int(config_value(args.total_steps, training_cfg, "total_steps", 200_000)),
         start_step=start_step,
-        save_interval=args.save_interval,
-        output_dir=Path(args.output_dir),
+        save_interval=int(config_value(args.save_interval, training_cfg, "save_interval", 20_000)),
+        output_dir=Path(config_value(args.output_dir, training_cfg, "output_dir", "output/crowdsim_robot_ppo")),
         use_tensorboard=not args.no_tensorboard,
     )
 
@@ -258,10 +277,16 @@ def train_loop(
         mean_length = sum(recent_lengths) / max(len(recent_lengths), 1)
         reached = info.get("reached", torch.zeros_like(robot_done)).float().mean().item()
         collision = info.get("collision", torch.zeros_like(robot_done)).float().mean().item()
+        sfm_reference_distance = info.get("sfm_reference_distance")
+        if sfm_reference_distance is None:
+            sfm_ref_distance = 0.0
+        else:
+            sfm_ref_distance = sfm_reference_distance.float().mean().item()
         print(
             f"[CrowdSim][PPO] robot_steps={robot_steps} "
             f"return={mean_return:.3f} len={mean_length:.1f} "
             f"reached={reached:.2f} collision={collision:.2f} "
+            f"sfm_ref_distance={sfm_ref_distance:.3f} "
             f"policy_loss={stats['policy_loss']:.4f} "
             f"value_loss={stats['value_loss']:.4f} entropy={stats['entropy']:.4f}"
         )
@@ -271,6 +296,7 @@ def train_loop(
             mean_length=mean_length,
             reached=reached,
             collision=collision,
+            sfm_ref_distance=sfm_ref_distance,
             policy_loss=stats["policy_loss"],
             value_loss=stats["value_loss"],
             entropy=stats["entropy"],
@@ -300,6 +326,7 @@ class RobotTrainingLogger:
                 "mean_length",
                 "reached",
                 "collision",
+                "sfm_ref_distance",
                 "policy_loss",
                 "value_loss",
                 "entropy",
@@ -355,6 +382,7 @@ def load_config(path: Path) -> dict[str, Any]:
 
 
 def parse_scalar(value: str):
+    value = strip_inline_comment(value).strip()
     if (value.startswith('"') and value.endswith('"')) or (
         value.startswith("'") and value.endswith("'")
     ):
@@ -383,6 +411,19 @@ def parse_scalar(value: str):
         return value
 
 
+def strip_inline_comment(value: str) -> str:
+    quote: str | None = None
+    for idx, char in enumerate(value):
+        if char in {"'", '"'}:
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+        elif char == "#" and quote is None:
+            return value[:idx]
+    return value
+
+
 def cfg_path(path_like: str) -> Path:
     path = Path(path_like).expanduser()
     if path.is_absolute():
@@ -396,8 +437,27 @@ def validate_paths(paths: dict[str, Path]) -> None:
             raise FileNotFoundError(f"{label} not found: {path}")
 
 
+def configure_humanoid_state_recording(env, cfg: dict[str, Any]):
+    record_cfg = cfg.get("humanoid", {}).get("state_recording", {})
+    if not isinstance(record_cfg, dict) or not bool(record_cfg.get("enabled", False)):
+        return None
+
+    return configure_humanoid_state_recorder(
+        env,
+        HumanoidStateRecorderConfig(
+            output_dir=resolve_repo_path(
+                record_cfg.get("record_dir", "output/crowdsim_humanoid_state")
+            ),
+            fps=float(record_cfg.get("record_fps", 30.0)),
+            env_ids=str(record_cfg.get("record_envs", "0")),
+            auto_record=bool(record_cfg.get("auto_record", False)),
+            key=str(record_cfg.get("key", "H")),
+        ),
+    )
+
+
 def build_navigation_manager(
-    scene_map: Path,
+    map_metadata: OccupancyMapMetadata,
     num_humanoids: int,
     num_robots: int,
     device: torch.device,
@@ -407,47 +467,49 @@ def build_navigation_manager(
     if not bool(nav_cfg.get("enabled", False)):
         return None
 
-    scene_cfg = cfg.get("scene", {})
-    humanoid_cfg = cfg.get("humanoid", {})
-    car_cfg = cfg.get("car", {})
     path_cfg = nav_cfg.get("path", {})
-    marker_cfg = nav_cfg.get("markers", {})
-    rl_cfg = nav_cfg.get("rl", {})
+    local_cfg = nav_cfg.get("local", {})
+    recording_cfg = nav_cfg.get("recording", {})
+    humanoid_cfg = cfg.get("humanoid", {})
+    marker_cfg = get_marker_config(cfg)
+    rl_cfg = get_robot_rl_config(cfg)
     return CrowdNavigationManager(
         CrowdNavigationConfig(
-            map_path=scene_map,
-            map_resolution=float(scene_cfg.get("resolution", 0.05002501250625312)),
-            free_threshold=int(scene_cfg.get("free_threshold", 200)),
+            map_path=map_metadata.image_path,
+            map_resolution=map_metadata.resolution,
+            free_threshold=map_metadata.free_threshold,
+            map_origin_xy=map_metadata.origin_xy,
             num_humanoids=num_humanoids,
             num_robots=num_robots,
             device=device,
             seed=int(path_cfg.get("seed", 7)),
-            local_controller=str(nav_cfg.get("local_controller", "rl")),
-            agent_radius=float(nav_cfg.get("agent_radius", 0.35)),
-            humanoid_radius=float(humanoid_cfg.get("radius", 0.45)),
-            safe_distance=float(nav_cfg.get("safe_distance", 0.25)),
-            max_speed=float(nav_cfg.get("max_speed", 0.8)),
+            robot_control_mode=str(local_cfg.get("method", "rl")),
+            agent_radius=float(local_cfg.get("agent_radius", 0.35)),
+            safe_distance=float(local_cfg.get("safe_distance", 0.75)),
+            max_speed=float(local_cfg.get("max_speed", 1.5)),
             waypoint_tolerance=float(nav_cfg.get("waypoint_tolerance", 0.45)),
             goal_tolerance=float(nav_cfg.get("goal_tolerance", 0.75)),
             min_start_goal_distance=float(path_cfg.get("min_start_goal_distance", 5.0)),
             min_spawn_spacing=float(path_cfg.get("min_spawn_spacing", 1.2)),
-            neighbor_radius=float(nav_cfg.get("neighbor_radius", 4.0)),
-            obstacle_query_radius=int(nav_cfg.get("obstacle_query_radius", 14)),
-            max_obstacles=int(nav_cfg.get("max_obstacles", 16)),
+            planning_step_size=float(path_cfg.get("planning_step_size", 0.5)),
+            planning_clearance=float(path_cfg.get("planning_clearance", 0.2)),
+            neighbor_radius=float(local_cfg.get("neighbor_radius", 4.0)),
             collision_distance=float(nav_cfg.get("collision_distance", 0.75)),
             log_interval=int(nav_cfg.get("log_interval", 120)),
-            path_thin_spacing=float(path_cfg.get("path_thin_spacing", 0.35)),
-            wheel_radius=float(car_cfg.get("wheel_radius", 0.0325)),
-            wheel_base=float(car_cfg.get("wheel_base", 0.118)),
-            max_wheel_speed=float(car_cfg.get("max_wheel_speed", 12.0)),
-            heading_gain=float(car_cfg.get("heading_gain", 2.5)),
-            wheel_joint_indices=parse_optional_int_pair(car_cfg.get("wheel_joint_indices")),
+            update_hz=float(nav_cfg.get("update_hz", 30.0)),
+            trajectory_recording_enabled=bool(recording_cfg.get("enabled", True)),
+            trajectory_output_dir=resolve_repo_path(
+                recording_cfg.get("output_dir", "output/crowdsim_navigation")
+            ),
             visual_markers_enabled=bool(marker_cfg.get("enabled", False)),
-            marker_update_interval=max(1, int(marker_cfg.get("update_interval", 10))),
+            humanoid_target_enabled=bool(humanoid_cfg.get("target_enabled", True)),
+            local_target_timestep=float(local_cfg.get("target_timestep", 1.0)),
+            humanoid_target_min_heading_speed=float(
+                humanoid_cfg.get("min_heading_speed", 0.05)
+            ),
             rl_num_neighbors=int(rl_cfg.get("num_neighbors", 4)),
             rl_num_obstacles=int(rl_cfg.get("num_obstacles", 8)),
             rl_obstacle_radius=float(rl_cfg.get("obstacle_radius", 4.0)),
-            rl_action_yaw_rate=float(rl_cfg.get("action_yaw_rate", 2.5)),
             rl_progress_reward_scale=float(rl_cfg.get("progress_reward_scale", 4.0)),
             rl_goal_reward=float(rl_cfg.get("goal_reward", 10.0)),
             rl_collision_penalty=float(rl_cfg.get("collision_penalty", -10.0)),
@@ -457,15 +519,34 @@ def build_navigation_manager(
     )
 
 
-def parse_optional_int_pair(value) -> tuple[int, int] | None:
-    if value is None:
-        return None
-    if isinstance(value, str) and value.lower() in {"none", "null", ""}:
-        return None
-    items = list(value)
-    if len(items) != 2:
-        raise ValueError("wheel_joint_indices must be null or a two-item list.")
-    return (int(items[0]), int(items[1]))
+def merge_ppo_config(env_cfg: dict[str, Any], ppo_cfg: dict[str, Any]) -> None:
+    rl_cfg = ppo_cfg.get("rl", ppo_cfg)
+    if not isinstance(rl_cfg, dict):
+        return
+    env_cfg.setdefault("navigation", {})["rl"] = rl_cfg
+
+
+def get_robot_rl_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    nav_cfg = cfg.get("navigation", {})
+    rl_cfg = nav_cfg.get("rl", cfg.get("rl", {}))
+    return rl_cfg if isinstance(rl_cfg, dict) else {}
+
+
+def get_marker_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    nav_cfg = cfg.get("navigation", {})
+    marker_cfg = cfg.get("markers", nav_cfg.get("markers", {}))
+    return marker_cfg if isinstance(marker_cfg, dict) else {}
+
+
+def get_config_section(cfg: dict[str, Any], key: str) -> dict[str, Any]:
+    section = cfg.get(key, {})
+    return section if isinstance(section, dict) else {}
+
+
+def config_value(cli_value, cfg: dict[str, Any], key: str, default):
+    if cli_value is not None:
+        return cli_value
+    return cfg.get(key, default)
 
 
 if __name__ == "__main__":

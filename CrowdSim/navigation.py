@@ -4,200 +4,17 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import torch
 
+from CrowdSim.differential_control import DifferentialDriveConfig, ManualDifferentialController
 from CrowdSim.nav_task import NavigationTask, NavigationTaskConfig
-from CrowdSim.plan.orca import ORCA
 from CrowdSim.plan.sfm import Social_Force
-
-
-DEFAULT_WHEEL_RADIUS = 0.0325
-DEFAULT_WHEEL_BASE = 0.118
-DEFAULT_MAX_WHEEL_SPEED = 12.0
-DEFAULT_HEADING_GAIN = 2.5
-
-
-class CrowdNavigationMarkers:
-    """Lightweight IsaacLab visual markers for CrowdSim navigation debugging."""
-
-    def __init__(self, device: torch.device, enabled: bool) -> None:
-        self.device = device
-        self.enabled = enabled
-        self.humanoid_start_marker = None
-        self.robot_start_marker = None
-        self.humanoid_path_marker = None
-        self.robot_path_marker = None
-        self.velocity_marker = None
-
-    def create(self, manager: "CrowdNavigationManager") -> None:
-        if not self.enabled:
-            return
-
-        import isaaclab.sim as sim_utils
-        from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
-        from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-
-        self.humanoid_start_marker = VisualizationMarkers(
-            VisualizationMarkersCfg(
-                prim_path="/Visuals/CrowdSim/humanoid_starts",
-                markers={
-                    "marker": sim_utils.SphereCfg(
-                        radius=1.0,
-                        visual_material=sim_utils.PreviewSurfaceCfg(
-                            diffuse_color=(0.1, 0.9, 0.2)
-                        ),
-                    )
-                },
-            )
-        )
-        self.robot_start_marker = VisualizationMarkers(
-            VisualizationMarkersCfg(
-                prim_path="/Visuals/CrowdSim/robot_starts",
-                markers={
-                    "marker": sim_utils.SphereCfg(
-                        radius=1.0,
-                        visual_material=sim_utils.PreviewSurfaceCfg(
-                            diffuse_color=(0.0, 0.55, 1.0)
-                        ),
-                    )
-                },
-            )
-        )
-        self.humanoid_path_marker = VisualizationMarkers(
-            VisualizationMarkersCfg(
-                prim_path="/Visuals/CrowdSim/humanoid_paths",
-                markers={
-                    "marker": sim_utils.SphereCfg(
-                        radius=1.0,
-                        visual_material=sim_utils.PreviewSurfaceCfg(
-                            diffuse_color=(0.9, 0.25, 0.1)
-                        ),
-                    )
-                },
-            )
-        )
-        self.robot_path_marker = VisualizationMarkers(
-            VisualizationMarkersCfg(
-                prim_path="/Visuals/CrowdSim/robot_paths",
-                markers={
-                    "marker": sim_utils.SphereCfg(
-                        radius=1.0,
-                        visual_material=sim_utils.PreviewSurfaceCfg(
-                            diffuse_color=(0.0, 0.9, 1.0)
-                        ),
-                    )
-                },
-            )
-        )
-        self.velocity_marker = VisualizationMarkers(
-            VisualizationMarkersCfg(
-                prim_path="/Visuals/CrowdSim/velocity_arrows",
-                markers={
-                    "marker": sim_utils.UsdFileCfg(
-                        usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/arrow_x.usd",
-                        scale=(1.0, 0.1, 0.1),
-                        visual_material=sim_utils.PreviewSurfaceCfg(
-                            diffuse_color=(1.0, 0.85, 0.0),
-                            opacity=0.85,
-                        ),
-                    )
-                },
-            )
-        )
-        self.update_starts(manager.starts_xy, manager.config.num_humanoids)
-        self.update_paths(manager.paths_xy, manager.config.num_humanoids)
-        self.update_velocity(manager.starts_xy, manager.goals_xy - manager.starts_xy, manager)
-
-    def update_starts(self, starts_xy: np.ndarray, num_humanoids: int) -> None:
-        if not self.enabled:
-            return
-
-        humanoid_xy = starts_xy[:num_humanoids]
-        robot_xy = starts_xy[num_humanoids:]
-        self._visualize_spheres(self.humanoid_start_marker, humanoid_xy, z=0.06, scale=0.18)
-        self._visualize_spheres(self.robot_start_marker, robot_xy, z=0.08, scale=0.22)
-
-    def update_paths(self, paths_xy: list[np.ndarray], num_humanoids: int) -> None:
-        if not self.enabled:
-            return
-
-        humanoid_points = self._flatten_paths(paths_xy[:num_humanoids])
-        robot_points = self._flatten_paths(paths_xy[num_humanoids:])
-        self._visualize_spheres(self.humanoid_path_marker, humanoid_points, z=0.035, scale=0.055)
-        self._visualize_spheres(self.robot_path_marker, robot_points, z=0.045, scale=0.065)
-
-    def update_velocity(
-        self,
-        positions_xy: np.ndarray,
-        velocities_xy: np.ndarray,
-        manager: "CrowdNavigationManager",
-    ) -> None:
-        if not self.enabled or self.velocity_marker is None or len(positions_xy) == 0:
-            return
-
-        directions = velocities_xy.copy()
-        speeds = np.linalg.norm(directions, axis=1)
-        for agent_id, speed in enumerate(speeds):
-            if speed > 1e-4:
-                continue
-            fallback = manager._current_waypoint(agent_id) - positions_xy[agent_id]
-            if np.linalg.norm(fallback) <= 1e-4:
-                fallback = manager.goals_xy[agent_id] - positions_xy[agent_id]
-            directions[agent_id] = fallback
-            speeds[agent_id] = np.linalg.norm(fallback)
-
-        yaws = np.arctan2(directions[:, 1], directions[:, 0])
-        translations = np.zeros((len(positions_xy), 3), dtype=np.float32)
-        translations[:, :2] = positions_xy
-        translations[:, 2] = 0.55
-        orientations = self._yaw_to_quat_wxyz(yaws)
-        lengths = np.clip(speeds / max(manager.config.max_speed, 1e-4), 0.25, 1.0)
-        scales = np.column_stack(
-            [0.85 * lengths, 0.12 * np.ones_like(lengths), 0.12 * np.ones_like(lengths)]
-        ).astype(np.float32)
-
-        self.velocity_marker.visualize(
-            translations=translations,
-            orientations=orientations,
-            scales=scales,
-        )
-
-    def _visualize_spheres(self, marker, xy: np.ndarray, z: float, scale: float) -> None:
-        if marker is None or len(xy) == 0:
-            return
-        translations = np.zeros((len(xy), 3), dtype=np.float32)
-        translations[:, :2] = xy
-        translations[:, 2] = z
-        orientations = np.zeros((len(xy), 4), dtype=np.float32)
-        orientations[:, 0] = 1.0
-        scales = np.full((len(xy), 3), scale, dtype=np.float32)
-        marker.visualize(
-            translations=translations,
-            orientations=orientations,
-            scales=scales,
-        )
-
-    @staticmethod
-    def _flatten_paths(paths_xy: list[np.ndarray]) -> np.ndarray:
-        if not paths_xy:
-            return np.zeros((0, 2), dtype=np.float32)
-        non_empty = [path for path in paths_xy if len(path) > 0]
-        if not non_empty:
-            return np.zeros((0, 2), dtype=np.float32)
-        return np.concatenate(non_empty, axis=0).astype(np.float32)
-
-    @staticmethod
-    def _yaw_to_quat_wxyz(yaws: np.ndarray) -> np.ndarray:
-        quats = np.zeros((len(yaws), 4), dtype=np.float32)
-        half_yaws = 0.5 * yaws
-        quats[:, 0] = np.cos(half_yaws)
-        quats[:, 3] = np.sin(half_yaws)
-        return quats
+from CrowdSim.robot_rl_navigation import RobotRLNavigationMixin
 
 
 @dataclass
@@ -208,33 +25,32 @@ class CrowdNavigationConfig:
     num_humanoids: int
     num_robots: int
     device: torch.device
+    map_origin_xy: tuple[float, float] = (0.0, 0.0)
     seed: int = 7
-    local_controller: str = "orca"
+    robot_control_mode: str = "sfm"
     agent_radius: float = 0.35
-    humanoid_radius: float = 0.45
-    safe_distance: float = 0.25
-    max_speed: float = 0.8
+    safe_distance: float = 0.75
+    max_speed: float = 1.5
     waypoint_tolerance: float = 0.45
     goal_tolerance: float = 0.75
     min_start_goal_distance: float = 5.0
     min_spawn_spacing: float = 1.2
+    planning_step_size: float = 0.5
+    planning_clearance: float = 0.2
     neighbor_radius: float = 4.0
-    obstacle_query_radius: int = 14
-    max_obstacles: int = 16
     collision_distance: float = 0.75
     log_interval: int = 120
-    path_thin_spacing: float = 0.35
-    wheel_radius: float = DEFAULT_WHEEL_RADIUS
-    wheel_base: float = DEFAULT_WHEEL_BASE
-    max_wheel_speed: float = DEFAULT_MAX_WHEEL_SPEED
-    heading_gain: float = DEFAULT_HEADING_GAIN
-    wheel_joint_indices: tuple[int, int] | None = None
+    update_hz: float = 30.0
+    trajectory_recording_enabled: bool = True
+    trajectory_output_dir: Path = Path("output/crowdsim_navigation")
+    differential_drive: DifferentialDriveConfig = field(default_factory=DifferentialDriveConfig)
     visual_markers_enabled: bool = False
-    marker_update_interval: int = 10
+    humanoid_target_enabled: bool = True
+    local_target_timestep: float = 1.0
+    humanoid_target_min_heading_speed: float = 0.05
     rl_num_neighbors: int = 4
     rl_num_obstacles: int = 8
     rl_obstacle_radius: float = 4.0
-    rl_action_yaw_rate: float = 2.5
     rl_progress_reward_scale: float = 4.0
     rl_goal_reward: float = 10.0
     rl_collision_penalty: float = -10.0
@@ -242,7 +58,7 @@ class CrowdNavigationConfig:
     rl_max_episode_steps: int = 600
 
 
-class CrowdNavigationManager:
+class CrowdNavigationManager(RobotRLNavigationMixin):
     """Plan and control CrowdSim agents in the shared Office map.
 
     Humanoids are still controlled by the loaded MaskedMimic policy. This manager
@@ -259,10 +75,12 @@ class CrowdNavigationManager:
                 map_resolution=config.map_resolution,
                 free_threshold=config.free_threshold,
                 num_agents=self.num_agents,
+                map_origin_xy=config.map_origin_xy,
                 seed=config.seed,
                 min_start_goal_distance=config.min_start_goal_distance,
                 min_spawn_spacing=config.min_spawn_spacing,
-                path_thin_spacing=config.path_thin_spacing,
+                planning_step_size=config.planning_step_size,
+                planning_clearance=config.planning_clearance,
             )
         )
 
@@ -279,30 +97,32 @@ class CrowdNavigationManager:
         self.waypoint_ids = np.ones(self.num_agents, dtype=np.int64)
         self.reached = np.zeros(self.num_agents, dtype=bool)
         self.collision_pairs: set[tuple[int, int]] = set()
+        self.env_step_count = 0
         self.step_count = 0
+        self._env_dt = 1.0 / 30.0
+        self._update_interval_steps = self._compute_update_interval_steps(self._env_dt)
         self._last_positions = self.starts_xy.copy()
-        self._markers: CrowdNavigationMarkers | None = None
         self._wheel_targets_tensor: torch.Tensor | None = None
         self._joint_velocity_targets: torch.Tensor | None = None
+        self._wheel_controller = ManualDifferentialController(config.differential_drive)
+        self._sfm_waypoints = self.starts_xy.copy().astype(np.float32)
+        self._humanoid_sfm_waypoints = self.starts_xy[: config.num_humanoids].copy().astype(np.float32)
+        self._robot_sfm_waypoints = self.starts_xy[
+            config.num_humanoids : config.num_humanoids + config.num_robots
+        ].copy().astype(np.float32)
+        self._humanoid_target_yaws = np.zeros(config.num_humanoids, dtype=np.float32)
+        self._printed_masked_mimic_target_warning = False
+        self._humanoid_sfm_target_marker = None
+        self._humanoid_path_target_marker = None
         self.path_log_path = self._write_navigation_path_log()
+        self.trajectory_log_path = self._open_trajectory_log()
 
-        planner_cfg = {
-            "map": {"resolution_viz": self.pixels_per_meter},
-            "env": {"dt": self._dt(), "safe_distance": config.safe_distance},
-            "agent": {"radius": config.agent_radius, "max_vel": config.max_speed},
-        }
-        if config.local_controller == "orca":
-            self.local_controller = ORCA(self.obstacle_map, planner_cfg)
-        elif config.local_controller == "sfm":
-            import cv2
-
-            free_uint8 = self.free_mask.astype(np.uint8)
-            distance_px = cv2.distanceTransform(free_uint8, cv2.DIST_L2, 5)
-            self.local_controller = Social_Force(distance_px * config.map_resolution, planner_cfg)
-        elif config.local_controller == "rl":
-            self.local_controller = None
-        else:
-            raise ValueError(f"Unsupported local controller: {config.local_controller}")
+        controller_mode = config.robot_control_mode.lower()
+        if controller_mode not in {"sfm", "rl"}:
+            raise ValueError(
+                f"Unsupported navigation.local.method: {config.robot_control_mode}"
+            )
+        self.sfm_controller = self._make_sfm_controller(config.agent_radius)
 
         self._robot_rl_actions = np.zeros((config.num_robots, 2), dtype=np.float32)
         self._robot_prev_goal_dist = self._robot_goal_distances(self.starts_xy)
@@ -328,6 +148,9 @@ class CrowdNavigationManager:
     def attach(self, env) -> None:
         self.env = env
         self.robot = getattr(env, "crowdsim_robot", None)
+        self._env_dt = self._read_env_dt(env)
+        self._update_interval_steps = self._compute_update_interval_steps(self._env_dt)
+        self._refresh_controller_dt()
         if self.config.num_robots > 0 and self.robot is None:
             raise RuntimeError("Navigation requested robot control, but crowdsim_robot is missing.")
         if self.config.num_robots > 0:
@@ -338,7 +161,7 @@ class CrowdNavigationManager:
                 dtype=torch.float32,
                 device=self.config.device,
             )
-            if self.config.wheel_joint_indices is None and num_joints != 2:
+            if self.config.differential_drive.wheel_joint_indices is None and num_joints != 2:
                 self._joint_velocity_targets = torch.zeros(
                     self.config.num_robots,
                     num_joints,
@@ -351,30 +174,54 @@ class CrowdNavigationManager:
         original_step = env.step
 
         def step_with_navigation(env_self, action):
-            self.pre_step()
+            should_update_navigation = self._should_update_navigation()
+            if should_update_navigation:
+                self.pre_step()
             result = original_step(action)
-            self.post_step()
+            self.env_step_count += 1
+            if should_update_navigation:
+                self.post_step()
             return result
 
         env.step = types.MethodType(step_with_navigation, env)
         env.crowdsim_navigation = self
-        self._markers = CrowdNavigationMarkers(
-            device=self.config.device,
+        self._attach_masked_mimic_navigation_targets(env)
+        self.task.create_visualization_markers(
+            num_humanoids=self.config.num_humanoids,
             enabled=self.config.visual_markers_enabled
             and not getattr(env.simulator, "headless", True),
         )
-        self._markers.create(self)
+        self._create_humanoid_target_markers(
+            enabled=self.config.visual_markers_enabled
+            and self.config.humanoid_target_enabled
+            and not getattr(env.simulator, "headless", True)
+        )
         print(
             f"[CrowdSim] Navigation enabled: {self.config.num_humanoids} humanoid(s), "
-            f"{self.config.num_robots} robot(s), controller={self.config.local_controller}."
+            f"{self.config.num_robots} robot(s), robot_control={self.config.robot_control_mode}."
         )
+        print(
+            "[CrowdSim] Navigation update rate: "
+            f"{self._navigation_update_hz():.3g} Hz "
+            f"(env_dt={self._env_dt:.6f}s, every {self._update_interval_steps} env step(s))."
+        )
+        if self.config.humanoid_target_enabled:
+            print(
+                "[CrowdSim] Humanoid navigation targets enabled: "
+                "controller=sfm, "
+                "format=Pelvis translation + Pelvis rotation."
+            )
         print(f"[CrowdSim] Navigation path log: {self.path_log_path}")
+        if self._trajectory_log_file is not None:
+            print(f"[CrowdSim] Navigation trajectory log: {self.trajectory_log_path}")
 
     def pre_step(self) -> None:
+        positions, velocities = self._read_agent_state()
+        self._compute_sfm_reference_waypoints(positions, velocities)
+
         if self.config.num_robots == 0:
             return
 
-        positions, velocities = self._read_agent_state()
         wheel_targets = self._compute_robot_wheel_targets(positions, velocities)
         self._write_robot_wheel_targets(wheel_targets)
 
@@ -384,19 +231,22 @@ class CrowdNavigationManager:
         self._update_waypoints_and_goals(positions)
         new_pairs = self._detect_collisions(positions)
         self._update_robot_rl_feedback(positions, velocities, new_pairs)
-        if (
-            self._markers is not None
-            and self.config.marker_update_interval > 0
-            and self.step_count % self.config.marker_update_interval == 0
-        ):
-            self._markers.update_velocity(positions, velocities, self)
         self._last_positions = positions
         self.env.extras["crowdsim_navigation"] = {
             "reached": int(self.reached.sum()),
             "num_agents": self.num_agents,
             "collision_pairs": len(self.collision_pairs),
             "new_collision_pairs": len(new_pairs),
+            "update_hz": self._navigation_update_hz(),
         }
+        if self.config.num_robots > 0:
+            robot_sfm_distances = np.linalg.norm(
+                self._robot_sfm_waypoints - positions[self.config.num_humanoids :],
+                axis=1,
+            )
+            self.env.extras["crowdsim_navigation"]["robot_sfm_target_distance_mean"] = float(
+                robot_sfm_distances.mean()
+            )
 
         if self.config.log_interval > 0 and self.step_count % self.config.log_interval == 0:
             print(
@@ -406,6 +256,7 @@ class CrowdNavigationManager:
             )
         if new_pairs:
             print(f"[CrowdSim] Collision warning: {sorted(new_pairs)}")
+        self._record_trajectory_frame(positions, velocities)
 
     def _initial_robot_yaws(self) -> np.ndarray:
         yaws = np.zeros(self.config.num_robots, dtype=np.float32)
@@ -451,6 +302,12 @@ class CrowdNavigationManager:
             "created_at": timestamp,
             "map_path": str(self.config.map_path),
             "map_resolution": self.config.map_resolution,
+            "map_origin_xy": list(self.config.map_origin_xy),
+            "free_threshold": self.config.free_threshold,
+            "planning_step_size": self.config.planning_step_size,
+            "planning_clearance": self.config.planning_clearance,
+            "navigation_update_hz": self._navigation_update_hz(),
+            "local_target_timestep": self.config.local_target_timestep,
             "num_humanoids": self.config.num_humanoids,
             "num_cars": self.config.num_robots,
             "agents": records,
@@ -459,6 +316,67 @@ class CrowdNavigationManager:
         latest_path.write_text(text, encoding="utf-8")
         timestamp_path.write_text(text, encoding="utf-8")
         return latest_path
+
+    def _open_trajectory_log(self) -> Path | None:
+        self._trajectory_log_file = None
+        self._trajectory_timestamp_file = None
+        if not self.config.trajectory_recording_enabled:
+            return None
+
+        output_dir = Path(self.config.trajectory_output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        latest_path = output_dir / "trajectory_latest.jsonl"
+        timestamp_path = output_dir / f"trajectory_{timestamp}.jsonl"
+        self._trajectory_log_file = latest_path.open("w", encoding="utf-8")
+        self._trajectory_timestamp_file = timestamp_path.open("w", encoding="utf-8")
+        metadata = {
+            "type": "metadata",
+            "created_at": timestamp,
+            "path_log": str(self.path_log_path),
+            "timestamp_path": str(timestamp_path),
+            "map_path": str(self.config.map_path),
+            "map_resolution": self.config.map_resolution,
+            "map_origin_xy": list(self.config.map_origin_xy),
+            "num_humanoids": self.config.num_humanoids,
+            "num_cars": self.config.num_robots,
+            "num_agents": self.num_agents,
+            "navigation_update_hz": self._navigation_update_hz(),
+            "local_target_timestep": self.config.local_target_timestep,
+        }
+        line = json.dumps(metadata) + "\n"
+        self._trajectory_log_file.write(line)
+        self._trajectory_timestamp_file.write(line)
+        self._trajectory_log_file.flush()
+        self._trajectory_timestamp_file.flush()
+        return latest_path
+
+    def _record_trajectory_frame(self, positions: np.ndarray, velocities: np.ndarray) -> None:
+        if self._trajectory_log_file is None:
+            return
+
+        current_waypoints = np.asarray(
+            [self._current_waypoint(agent_id) for agent_id in range(self.num_agents)],
+            dtype=np.float32,
+        )
+        frame = {
+            "type": "frame",
+            "step": int(self.step_count),
+            "env_step": int(self.env_step_count),
+            "time": float(self.step_count * self._dt()),
+            "positions_xy": positions.astype(float).tolist(),
+            "velocities_xy": velocities.astype(float).tolist(),
+            "current_waypoints_xy": current_waypoints.astype(float).tolist(),
+            "local_targets_xy": self._sfm_waypoints.astype(float).tolist(),
+            "reached": self.reached.astype(bool).tolist(),
+            "collision_pairs": [list(pair) for pair in sorted(self.collision_pairs)],
+        }
+        line = json.dumps(frame) + "\n"
+        self._trajectory_log_file.write(line)
+        if self._trajectory_timestamp_file is not None:
+            self._trajectory_timestamp_file.write(line)
+            self._trajectory_timestamp_file.flush()
+        self._trajectory_log_file.flush()
 
     def _read_agent_state(self) -> tuple[np.ndarray, np.ndarray]:
         humanoid_state = self.env.simulator.get_root_state()
@@ -479,41 +397,266 @@ class CrowdNavigationManager:
         self, positions: np.ndarray, velocities: np.ndarray
     ) -> np.ndarray:
         wheel_targets = np.zeros((self.config.num_robots, 2), dtype=np.float32)
-        robot_offset = self.config.num_humanoids
+        if self.config.robot_control_mode.lower() == "rl":
+            for robot_idx in range(self.config.num_robots):
+                wheel_targets[robot_idx] = self._wheel_controller.action_to_wheels(
+                    self._robot_rl_actions[robot_idx],
+                    self.config.max_speed,
+                )
+            return wheel_targets
 
+        robot_yaws = self._robot_yaws()
         for robot_idx in range(self.config.num_robots):
-            agent_id = robot_offset + robot_idx
+            agent_id = self.config.num_humanoids + robot_idx
+            if self.reached[agent_id]:
+                continue
+            wheel_targets[robot_idx] = self._wheel_controller.waypoint_to_wheels(
+                current_xy=positions[agent_id],
+                current_yaw=float(robot_yaws[robot_idx]),
+                target_xy=self._robot_sfm_waypoints[robot_idx],
+                target_timestep=self.config.local_target_timestep,
+                max_speed=self.config.max_speed,
+            )
+
+        return wheel_targets
+
+    def _compute_sfm_reference_waypoints(
+        self, positions: np.ndarray, velocities: np.ndarray
+    ) -> None:
+        self._sfm_waypoints[: self.num_agents] = positions[: self.num_agents]
+        target_timestep = max(float(self.config.local_target_timestep), 1e-5)
+        if self.config.num_humanoids > 0:
+            self._humanoid_sfm_waypoints[:] = positions[: self.config.num_humanoids]
+        if self.config.num_robots > 0:
+            self._robot_sfm_waypoints[:] = positions[
+                self.config.num_humanoids : self.config.num_humanoids + self.config.num_robots
+            ]
+
+        for agent_id in range(self.num_agents):
             if self.reached[agent_id]:
                 continue
 
             pos = positions[agent_id]
             vel = velocities[agent_id]
             goal = self._current_waypoint(agent_id)
+            nbr_state = self._neighbor_state(agent_id, positions, velocities)
+            cord_int = self._clip_pixel_yx(self.world_to_pixel(pos))
+            desired_vel, _ = self.sfm_controller.get_action(
+                (pos, cord_int, vel, goal),
+                (nbr_state[0], nbr_state[1], nbr_state[2]),
+            )
+            desired_vel = self._clip_desired_velocity(np.asarray(desired_vel, dtype=np.float32))
+            sfm_waypoint = (pos + desired_vel * target_timestep).astype(np.float32)
+            self._sfm_waypoints[agent_id] = sfm_waypoint
 
-            if self.config.local_controller == "rl":
-                wheel_targets[robot_idx] = self._rl_action_to_wheels(
-                    self._robot_rl_actions[robot_idx]
-                )
+            if agent_id >= self.config.num_humanoids:
+                robot_idx = agent_id - self.config.num_humanoids
+                self._robot_sfm_waypoints[robot_idx] = sfm_waypoint
                 continue
 
-            nbr_state = self._neighbor_state(agent_id, positions, velocities)
-            cord_int = self.world_to_pixel(pos)
-            if self.config.local_controller == "orca":
-                obstacles = self._nearby_obstacles_world(pos)
-                desired_vel, _ = self.local_controller.get_action(
-                    (pos, cord_int, vel, goal),
-                    nbr_state,
-                    obstacles,
+            self._humanoid_sfm_waypoints[agent_id] = sfm_waypoint
+
+            heading_delta = sfm_waypoint - pos
+            if np.linalg.norm(heading_delta) >= self.config.humanoid_target_min_heading_speed:
+                self._humanoid_target_yaws[agent_id] = math.atan2(
+                    float(heading_delta[1]), float(heading_delta[0])
                 )
             else:
-                desired_vel, _ = self.local_controller.get_action(
-                    (pos, cord_int, vel, goal),
-                    (nbr_state[0], nbr_state[1], nbr_state[2]),
-                )
+                fallback = self._waypoint_desired_velocity(pos, goal)
+                if np.linalg.norm(fallback) >= 1e-5:
+                    self._humanoid_target_yaws[agent_id] = math.atan2(
+                        float(fallback[1]), float(fallback[0])
+                    )
 
-            wheel_targets[robot_idx] = self._desired_velocity_to_wheels(robot_idx, desired_vel)
+    def _attach_masked_mimic_navigation_targets(self, env) -> None:
+        if not self.config.humanoid_target_enabled or self.config.num_humanoids == 0:
+            return
+        control_manager = getattr(env, "control_manager", None)
+        component = getattr(control_manager, "components", {}).get("masked_mimic")
+        if component is None:
+            print("[CrowdSim] Humanoid navigation targets skipped: masked_mimic control not found.")
+            return
 
-        return wheel_targets
+        import types
+
+        original_populate_context = component.populate_context
+
+        def populate_context_with_navigation_targets(component_self, ctx):
+            original_populate_context(ctx)
+            self._override_masked_mimic_context(component_self, ctx)
+
+        component.populate_context = types.MethodType(populate_context_with_navigation_targets, component)
+
+    def _override_masked_mimic_context(self, component, ctx) -> None:
+        base = getattr(ctx, "masked_mimic", None)
+        if base is None:
+            return
+
+        try:
+            from protomotions.envs.context_views import MaskedMimicContext
+        except ImportError:
+            return
+
+        conditionable_body_ids = getattr(component, "conditionable_body_ids", None)
+        if conditionable_body_ids is None:
+            self._warn_masked_mimic_target_once("conditionable_body_ids missing.")
+            return
+
+        pelvis_body_id = int(getattr(component.env.robot_config, "anchor_body_index", 0))
+        pelvis_matches = (conditionable_body_ids == pelvis_body_id).nonzero(as_tuple=False)
+        if pelvis_matches.numel() == 0:
+            self._warn_masked_mimic_target_once(
+                f"pelvis body id {pelvis_body_id} is not conditionable."
+            )
+            return
+
+        num_envs, num_future_steps = base.ref_pos.shape[:2]
+        num_humanoids = min(self.config.num_humanoids, num_envs)
+        if num_humanoids <= 0:
+            return
+
+        device = base.ref_pos.device
+        dtype = base.ref_pos.dtype
+        offsets_np = self._humanoid_target_offsets(num_future_steps)
+        offsets = torch.as_tensor(offsets_np, dtype=dtype, device=device)
+
+        ref_pos = base.ref_pos.clone()
+        ref_rot = base.ref_rot.clone()
+        target_times = base.target_times.clone()
+        time_offsets = base.time_offsets.clone()
+        target_bodies_masks = torch.zeros_like(base.target_bodies_masks)
+        target_poses_masks = torch.zeros_like(base.target_poses_masks)
+
+        current_pelvis = ctx.current.rigid_body_pos[:num_humanoids, pelvis_body_id, :]
+        xy_targets_np, target_yaws_np = self._humanoid_future_targets_from_path(
+            current_pelvis[:, :2].detach().cpu().numpy(),
+            offsets_np,
+        )
+        self._update_humanoid_target_markers(
+            xy_targets_np,
+            current_pelvis[:, 2].detach().cpu().numpy(),
+        )
+        xy_targets = torch.as_tensor(xy_targets_np, dtype=dtype, device=device)
+        yaws = torch.as_tensor(target_yaws_np, dtype=dtype, device=device)
+        active = torch.as_tensor(
+            ~self.reached[:num_humanoids],
+            dtype=torch.bool,
+            device=device,
+        )
+
+        ref_pos[:num_humanoids, :, pelvis_body_id, :2] = xy_targets
+        ref_pos[:num_humanoids, :, pelvis_body_id, 2] = current_pelvis[:, None, 2]
+
+        yaw_quat = self._yaw_to_quat_xyzw_tensor(yaws.reshape(-1)).to(dtype=dtype)
+        ref_rot[:num_humanoids, :, pelvis_body_id, :] = yaw_quat.view(
+            num_humanoids, num_future_steps, 4
+        )
+
+        pelvis_condition_index = int(pelvis_matches[0].item())
+        masks = target_bodies_masks.view(
+            num_envs,
+            num_future_steps,
+            int(getattr(component, "num_conditionable_bodies")),
+            2,
+        )
+        masks[:num_humanoids, :, pelvis_condition_index, 0] = active[:, None]
+        masks[:num_humanoids, :, pelvis_condition_index, 1] = active[:, None]
+        target_poses_masks[:num_humanoids, :] = active[:, None]
+
+        if hasattr(component.env, "motion_manager"):
+            motion_times = component.env.motion_manager.motion_times.to(device=device, dtype=dtype)
+            target_times[:num_humanoids, :] = motion_times[:num_humanoids, None] + offsets[None, :]
+        else:
+            target_times[:num_humanoids, :] = offsets[None, :]
+        time_offsets[:num_humanoids, :] = offsets[None, :]
+
+        ctx.masked_mimic = MaskedMimicContext(
+            mimic=base.mimic,
+            ref_pos=ref_pos,
+            ref_rot=ref_rot,
+            target_times=target_times,
+            time_offsets=time_offsets,
+            target_poses_masks=target_poses_masks,
+            target_bodies_masks=target_bodies_masks,
+        )
+
+    def _warn_masked_mimic_target_once(self, reason: str) -> None:
+        if self._printed_masked_mimic_target_warning:
+            return
+        self._printed_masked_mimic_target_warning = True
+        print(f"[CrowdSim] Humanoid navigation targets disabled for this run: {reason}")
+
+    def _create_humanoid_target_markers(self, enabled: bool) -> None:
+        if not enabled:
+            return
+
+        import isaaclab.sim as sim_utils
+        from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+
+        self._humanoid_sfm_target_marker = VisualizationMarkers(
+            VisualizationMarkersCfg(
+                prim_path="/Visuals/CrowdSim/humanoid_sfm_targets",
+                markers={
+                    "marker": sim_utils.SphereCfg(
+                        radius=1.0,
+                        visual_material=sim_utils.PreviewSurfaceCfg(
+                            diffuse_color=(1.0, 0.15, 0.95)
+                        ),
+                    )
+                },
+            )
+        )
+        self._humanoid_path_target_marker = VisualizationMarkers(
+            VisualizationMarkersCfg(
+                prim_path="/Visuals/CrowdSim/humanoid_path_targets",
+                markers={
+                    "marker": sim_utils.SphereCfg(
+                        radius=1.0,
+                        visual_material=sim_utils.PreviewSurfaceCfg(
+                            diffuse_color=(0.95, 0.95, 1.0)
+                        ),
+                    )
+                },
+            )
+        )
+
+    def _update_humanoid_target_markers(self, targets_xy: np.ndarray, pelvis_z: np.ndarray) -> None:
+        if self._humanoid_sfm_target_marker is None and self._humanoid_path_target_marker is None:
+            return
+        if targets_xy.size == 0:
+            return
+
+        sfm_steps = min(1, targets_xy.shape[1])
+        self._visualize_target_slots(
+            self._humanoid_sfm_target_marker,
+            targets_xy[:, :sfm_steps, :],
+            pelvis_z,
+            scale=0.16,
+        )
+        self._visualize_target_slots(
+            self._humanoid_path_target_marker,
+            targets_xy[:, sfm_steps:, :],
+            pelvis_z,
+            scale=0.11,
+        )
+
+    @staticmethod
+    def _visualize_target_slots(marker, targets_xy: np.ndarray, pelvis_z: np.ndarray, scale: float) -> None:
+        if marker is None or targets_xy.size == 0:
+            return
+
+        num_agents, num_steps = targets_xy.shape[:2]
+        translations = np.zeros((num_agents * num_steps, 3), dtype=np.float32)
+        translations[:, :2] = targets_xy.reshape(-1, 2)
+        translations[:, 2] = np.repeat(pelvis_z.astype(np.float32), num_steps)
+        orientations = np.zeros((len(translations), 4), dtype=np.float32)
+        orientations[:, 0] = 1.0
+        scales = np.full((len(translations), 3), scale, dtype=np.float32)
+        marker.visualize(
+            translations=translations,
+            orientations=orientations,
+            scales=scales,
+        )
 
     def _neighbor_state(
         self, agent_id: int, positions: np.ndarray, velocities: np.ndarray
@@ -529,284 +672,6 @@ class CrowdNavigationManager:
             velocities[agent_id] - velocities[nbrs_idx],
         )
 
-    def _nearby_obstacles_world(self, xy: np.ndarray) -> np.ndarray | None:
-        pixel_yx = self.world_to_pixel(xy)
-        radius = int(self.config.obstacle_query_radius)
-        y0 = max(0, int(pixel_yx[0]) - radius)
-        y1 = min(self.height, int(pixel_yx[0]) + radius + 1)
-        x0 = max(0, int(pixel_yx[1]) - radius)
-        x1 = min(self.width, int(pixel_yx[1]) + radius + 1)
-
-        region = self.obstacle_map[y0:y1, x0:x1]
-        obs_y, obs_x = np.nonzero(region)
-        if len(obs_y) == 0:
-            return None
-
-        pixels = np.column_stack([obs_y + y0, obs_x + x0])
-        dists = np.linalg.norm(pixels - pixel_yx[None, :], axis=1)
-        keep = np.argsort(dists)[: self.config.max_obstacles]
-        return np.asarray([self.pixel_to_world(pixel) for pixel in pixels[keep]], dtype=np.float32)
-
-    def _desired_velocity_to_wheels(self, robot_idx: int, desired_vel: np.ndarray) -> np.ndarray:
-        speed = float(np.linalg.norm(desired_vel))
-        if speed < 1e-5:
-            return np.zeros(2, dtype=np.float32)
-
-        quat = self.robot.data.root_quat_w[robot_idx].detach().cpu().numpy()
-        yaw = self._yaw_from_quat_wxyz(quat)
-        heading = np.array([math.cos(yaw), math.sin(yaw)], dtype=np.float32)
-        lateral = np.array([-math.sin(yaw), math.cos(yaw)], dtype=np.float32)
-
-        forward_speed = float(np.dot(desired_vel, heading))
-        lateral_error = float(np.dot(desired_vel, lateral))
-        yaw_rate = self.config.heading_gain * math.atan2(
-            lateral_error, max(abs(forward_speed), 1e-4)
-        )
-
-        r = self.config.wheel_radius
-        b = self.config.wheel_base
-        left = (forward_speed - 0.5 * b * yaw_rate) / r
-        right = (forward_speed + 0.5 * b * yaw_rate) / r
-        wheels = np.clip(
-            np.array([left, right], dtype=np.float32),
-            -self.config.max_wheel_speed,
-            self.config.max_wheel_speed,
-        )
-        return wheels
-
-    def set_robot_rl_actions(self, actions: torch.Tensor | np.ndarray) -> None:
-        """Set normalized RL actions for the next robot control step."""
-        if self.config.local_controller != "rl" or self.config.num_robots == 0:
-            return
-        if isinstance(actions, torch.Tensor):
-            values = actions.detach().cpu().numpy()
-        else:
-            values = np.asarray(actions, dtype=np.float32)
-        if values.shape != (self.config.num_robots, 2):
-            raise ValueError(
-                f"Expected RL robot actions with shape ({self.config.num_robots}, 2), "
-                f"got {values.shape}."
-            )
-        self._robot_rl_actions[:] = np.clip(values, -1.0, 1.0)
-
-    def get_robot_rl_observations(self) -> torch.Tensor:
-        """Return fixed-size observations for the robot navigation PPO policy."""
-        positions, velocities = self._read_agent_state()
-        obs = self._build_robot_rl_observations(positions, velocities)
-        self._robot_last_obs = obs
-        return obs
-
-    def get_robot_rl_feedback(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-        """Return next observations, rewards, dones, and diagnostics after env.step()."""
-        if self._robot_last_obs is None:
-            self.get_robot_rl_observations()
-        return (
-            self._robot_last_obs,
-            self._robot_last_rewards,
-            self._robot_last_dones,
-            self._robot_last_info,
-        )
-
-    @property
-    def robot_rl_obs_dim(self) -> int:
-        return 8 + 5 * self.config.rl_num_neighbors + 3 * self.config.rl_num_obstacles
-
-    def reset_robot_rl_episodes(self, done: torch.Tensor | np.ndarray) -> None:
-        """Reset finished robot-only navigation episodes without resetting humanoids."""
-        if self.config.local_controller != "rl" or self.config.num_robots == 0:
-            return
-        if isinstance(done, torch.Tensor):
-            done_np = done.detach().cpu().numpy().astype(bool)
-        else:
-            done_np = np.asarray(done, dtype=bool)
-        robot_ids = np.nonzero(done_np)[0]
-        if len(robot_ids) == 0:
-            return
-
-        agent_offset = self.config.num_humanoids
-        agent_ids = agent_offset + robot_ids
-        yaw = self._initial_robot_yaws()[robot_ids]
-        env_ids = torch.as_tensor(robot_ids, dtype=torch.long, device=self.config.device)
-        poses = self.robot.data.default_root_state[env_ids, :7].clone()
-        poses[:, 0:2] = torch.as_tensor(
-            self.starts_xy[agent_ids], dtype=torch.float32, device=self.config.device
-        )
-        poses[:, 3:7] = self._yaw_to_quat_tensor(torch.as_tensor(yaw, device=self.config.device))
-
-        self.robot.write_root_pose_to_sim(poses, env_ids=env_ids)
-        self.robot.write_root_velocity_to_sim(
-            torch.zeros((len(robot_ids), 6), dtype=torch.float32, device=self.config.device),
-            env_ids=env_ids,
-        )
-        self.robot.write_joint_state_to_sim(
-            self.robot.data.default_joint_pos[env_ids].clone(),
-            torch.zeros_like(self.robot.data.default_joint_vel[env_ids]),
-            env_ids=env_ids,
-        )
-        self.robot.reset(env_ids=env_ids)
-
-        self._robot_rl_actions[robot_ids] = 0.0
-        self.waypoint_ids[agent_ids] = 1
-        self.reached[agent_ids] = False
-        self._robot_episode_steps[robot_ids] = 0
-        self._robot_prev_goal_dist[robot_ids] = np.linalg.norm(
-            self.starts_xy[agent_ids] - self.goals_xy[agent_ids], axis=1
-        )
-        agent_id_set = {int(agent_id) for agent_id in agent_ids}
-        self.collision_pairs = {
-            pair
-            for pair in self.collision_pairs
-            if pair[0] not in agent_id_set and pair[1] not in agent_id_set
-        }
-
-    def _rl_action_to_wheels(self, action: np.ndarray) -> np.ndarray:
-        forward_speed = float(np.clip(action[0], -1.0, 1.0)) * self.config.max_speed
-        yaw_rate = float(np.clip(action[1], -1.0, 1.0)) * self.config.rl_action_yaw_rate
-        left = (forward_speed - 0.5 * self.config.wheel_base * yaw_rate) / self.config.wheel_radius
-        right = (forward_speed + 0.5 * self.config.wheel_base * yaw_rate) / self.config.wheel_radius
-        return np.clip(
-            np.array([left, right], dtype=np.float32),
-            -self.config.max_wheel_speed,
-            self.config.max_wheel_speed,
-        )
-
-    def _update_robot_rl_feedback(
-        self,
-        positions: np.ndarray,
-        velocities: np.ndarray,
-        new_pairs: set[tuple[int, int]],
-    ) -> None:
-        if self.config.local_controller != "rl" or self.config.num_robots == 0:
-            return
-
-        robot_offset = self.config.num_humanoids
-        robot_agent_ids = np.arange(robot_offset, robot_offset + self.config.num_robots)
-        current_dist = np.linalg.norm(positions[robot_agent_ids] - self.goals_xy[robot_agent_ids], axis=1)
-        progress = self._robot_prev_goal_dist - current_dist
-        self._robot_prev_goal_dist = current_dist
-        self._robot_episode_steps += 1
-
-        collision = np.zeros(self.config.num_robots, dtype=bool)
-        for i, j in new_pairs:
-            if robot_offset <= i < robot_offset + self.config.num_robots:
-                collision[i - robot_offset] = True
-            if robot_offset <= j < robot_offset + self.config.num_robots:
-                collision[j - robot_offset] = True
-
-        reached = self.reached[robot_agent_ids].copy()
-        timeout = self._robot_episode_steps >= self.config.rl_max_episode_steps
-        rewards = (
-            self.config.rl_time_penalty
-            + self.config.rl_progress_reward_scale * progress
-            + self.config.rl_goal_reward * reached.astype(np.float32)
-            + self.config.rl_collision_penalty * collision.astype(np.float32)
-        ).astype(np.float32)
-        dones = reached | collision | timeout
-
-        self._robot_last_obs = self._build_robot_rl_observations(positions, velocities)
-        self._robot_last_rewards = torch.as_tensor(rewards, dtype=torch.float32, device=self.config.device)
-        self._robot_last_dones = torch.as_tensor(dones, dtype=torch.bool, device=self.config.device)
-        self._robot_last_info = {
-            "reached": torch.as_tensor(reached, dtype=torch.bool, device=self.config.device),
-            "collision": torch.as_tensor(collision, dtype=torch.bool, device=self.config.device),
-            "timeout": torch.as_tensor(timeout, dtype=torch.bool, device=self.config.device),
-            "distance_to_goal": torch.as_tensor(current_dist, dtype=torch.float32, device=self.config.device),
-        }
-
-    def _build_robot_rl_observations(
-        self,
-        positions: np.ndarray,
-        velocities: np.ndarray,
-    ) -> torch.Tensor:
-        if self.config.num_robots == 0:
-            return torch.zeros((0, self.robot_rl_obs_dim), dtype=torch.float32, device=self.config.device)
-
-        robot_offset = self.config.num_humanoids
-        yaws = self._robot_yaws()
-        obs_rows: list[np.ndarray] = []
-        for robot_idx in range(self.config.num_robots):
-            agent_id = robot_offset + robot_idx
-            pos = positions[agent_id]
-            vel = velocities[agent_id]
-            yaw = yaws[robot_idx]
-
-            waypoint_local = self._world_vec_to_local(self._current_waypoint(agent_id) - pos, yaw)
-            goal_local = self._world_vec_to_local(self.goals_xy[agent_id] - pos, yaw)
-            vel_local = self._world_vec_to_local(vel, yaw)
-            row = [
-                waypoint_local[0] / max(self.config.neighbor_radius, 1e-4),
-                waypoint_local[1] / max(self.config.neighbor_radius, 1e-4),
-                goal_local[0] / max(self.config.min_start_goal_distance, 1e-4),
-                goal_local[1] / max(self.config.min_start_goal_distance, 1e-4),
-                vel_local[0] / max(self.config.max_speed, 1e-4),
-                vel_local[1] / max(self.config.max_speed, 1e-4),
-                math.sin(yaw),
-                math.cos(yaw),
-            ]
-
-            relpos = positions - pos
-            reldis = np.linalg.norm(relpos, axis=1)
-            mask = np.arange(self.num_agents) != agent_id
-            neighbor_ids = np.argsort(np.where(mask, reldis, np.inf))[: self.config.rl_num_neighbors]
-            for neighbor_id in neighbor_ids:
-                if not np.isfinite(reldis[neighbor_id]) or reldis[neighbor_id] > self.config.neighbor_radius:
-                    row.extend([0.0, 0.0, 0.0, 0.0, 0.0])
-                    continue
-                local_rel = self._world_vec_to_local(relpos[neighbor_id], yaw)
-                local_vel = self._world_vec_to_local(velocities[neighbor_id] - vel, yaw)
-                row.extend(
-                    [
-                        local_rel[0] / max(self.config.neighbor_radius, 1e-4),
-                        local_rel[1] / max(self.config.neighbor_radius, 1e-4),
-                        local_vel[0] / max(self.config.max_speed, 1e-4),
-                        local_vel[1] / max(self.config.max_speed, 1e-4),
-                        reldis[neighbor_id] / max(self.config.neighbor_radius, 1e-4),
-                    ]
-                )
-
-            obstacles = self._nearby_obstacles_world(pos)
-            obstacle_rows: list[np.ndarray] = []
-            if obstacles is not None and len(obstacles) > 0:
-                obstacle_rel = obstacles - pos
-                order = np.argsort(np.linalg.norm(obstacle_rel, axis=1))
-                obstacle_rows = [obstacle_rel[idx] for idx in order[: self.config.rl_num_obstacles]]
-            for obstacle_rel in obstacle_rows:
-                local_rel = self._world_vec_to_local(obstacle_rel, yaw)
-                dist = float(np.linalg.norm(obstacle_rel))
-                row.extend(
-                    [
-                        local_rel[0] / max(self.config.rl_obstacle_radius, 1e-4),
-                        local_rel[1] / max(self.config.rl_obstacle_radius, 1e-4),
-                        dist / max(self.config.rl_obstacle_radius, 1e-4),
-                    ]
-                )
-            for _ in range(self.config.rl_num_obstacles - len(obstacle_rows)):
-                row.extend([0.0, 0.0, 0.0])
-
-            obs_rows.append(np.asarray(row, dtype=np.float32))
-
-        obs = np.stack(obs_rows, axis=0)
-        return torch.as_tensor(obs, dtype=torch.float32, device=self.config.device)
-
-    def _robot_goal_distances(self, positions: np.ndarray) -> np.ndarray:
-        if self.config.num_robots == 0:
-            return np.zeros(0, dtype=np.float32)
-        start = self.config.num_humanoids
-        end = start + self.config.num_robots
-        return np.linalg.norm(positions[start:end] - self.goals_xy[start:end], axis=1).astype(np.float32)
-
-    def _robot_yaws(self) -> np.ndarray:
-        if self.config.num_robots == 0:
-            return np.zeros(0, dtype=np.float32)
-        quats = self.robot.data.root_quat_w[: self.config.num_robots].detach().cpu().numpy()
-        return np.asarray([self._yaw_from_quat_wxyz(quat) for quat in quats], dtype=np.float32)
-
-    @staticmethod
-    def _world_vec_to_local(vec: np.ndarray, yaw: float) -> np.ndarray:
-        heading = np.array([math.cos(yaw), math.sin(yaw)], dtype=np.float32)
-        lateral = np.array([-math.sin(yaw), math.cos(yaw)], dtype=np.float32)
-        return np.array([float(np.dot(vec, heading)), float(np.dot(vec, lateral))], dtype=np.float32)
-
     def _write_robot_wheel_targets(self, wheel_targets: np.ndarray) -> None:
         if self._wheel_targets_tensor is None:
             return
@@ -814,9 +679,10 @@ class CrowdNavigationManager:
         targets_cpu = torch.as_tensor(wheel_targets, dtype=torch.float32)
         self._wheel_targets_tensor.copy_(targets_cpu, non_blocking=True)
         targets = self._wheel_targets_tensor
-        if self.config.wheel_joint_indices is not None:
+        wheel_joint_indices = self.config.differential_drive.wheel_joint_indices
+        if wheel_joint_indices is not None:
             joint_ids = torch.as_tensor(
-                self.config.wheel_joint_indices,
+                wheel_joint_indices,
                 dtype=torch.long,
                 device=self.config.device,
             )
@@ -882,7 +748,146 @@ class CrowdNavigationManager:
     def pixel_to_world(self, pixel_yx: np.ndarray) -> np.ndarray:
         return self.task.pixel_to_world(pixel_yx)
 
+    def _planner_cfg(self, radius: float) -> dict:
+        return {
+            "map": {
+                "resolution": self.config.map_resolution,
+                "resolution_viz": self.pixels_per_meter,
+            },
+            "env": {
+                "dt": self._dt(),
+                "safe_distance": self.config.safe_distance,
+                "neighbor_radius": self.config.neighbor_radius,
+                "reach_distance": self.config.waypoint_tolerance,
+            },
+            "agent": {"radius": radius, "max_vel": self.config.max_speed},
+        }
+
+    def _make_sfm_controller(self, radius: float) -> Social_Force:
+        import cv2
+
+        free_uint8 = self.free_mask.astype(np.uint8)
+        distance_px = cv2.distanceTransform(free_uint8, cv2.DIST_L2, 5)
+        return Social_Force(distance_px * self.config.map_resolution, self._planner_cfg(radius))
+
+    def _waypoint_desired_velocity(self, pos: np.ndarray, goal: np.ndarray) -> np.ndarray:
+        delta = goal - pos
+        distance = float(np.linalg.norm(delta))
+        if distance < 1e-5:
+            return np.zeros(2, dtype=np.float32)
+        speed = min(self.config.max_speed, distance / max(self._dt(), 1e-5))
+        return (delta / distance * speed).astype(np.float32)
+
+    def _clip_desired_velocity(self, desired_vel: np.ndarray) -> np.ndarray:
+        if not np.all(np.isfinite(desired_vel)):
+            return np.zeros(2, dtype=np.float32)
+        speed = float(np.linalg.norm(desired_vel))
+        if speed <= self.config.max_speed:
+            return desired_vel.astype(np.float32)
+        return (desired_vel * (self.config.max_speed / max(speed, 1e-5))).astype(np.float32)
+
+    def _clip_pixel_yx(self, pixel_yx: np.ndarray) -> np.ndarray:
+        return np.array(
+            [
+                int(np.clip(pixel_yx[0], 0, self.height - 1)),
+                int(np.clip(pixel_yx[1], 0, self.width - 1)),
+            ],
+            dtype=np.int64,
+        )
+
+    def _humanoid_target_offsets(self, num_future_steps: int) -> np.ndarray:
+        timestep = max(float(self.config.local_target_timestep), self._dt())
+        return timestep * np.arange(1, num_future_steps + 1, dtype=np.float32)
+
+    def _humanoid_future_targets_from_path(
+        self, current_xy: np.ndarray, offsets: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        num_humanoids = min(self.config.num_humanoids, current_xy.shape[0])
+        num_steps = len(offsets)
+        targets = np.zeros((num_humanoids, num_steps, 2), dtype=np.float32)
+        yaws = np.zeros((num_humanoids, num_steps), dtype=np.float32)
+
+        for agent_id in range(num_humanoids):
+            pos = np.asarray(current_xy[agent_id], dtype=np.float32)
+            sfm_target = self._humanoid_sfm_waypoints[agent_id]
+            path = self._remaining_path_for_agent(agent_id, sfm_target)
+            previous = pos
+            last_yaw = float(self._humanoid_target_yaws[agent_id])
+
+            for step_id, offset in enumerate(offsets):
+                if step_id == 0:
+                    target = sfm_target
+                else:
+                    remaining_time = max(float(offset - offsets[0]), 0.0)
+                    lookahead_distance = float(self.config.max_speed) * remaining_time
+                    target = self._sample_path_by_distance(path, lookahead_distance)
+
+                targets[agent_id, step_id] = target
+                direction = target - previous
+                if np.linalg.norm(direction) < 1e-5:
+                    direction = target - pos
+                if np.linalg.norm(direction) >= 1e-5:
+                    last_yaw = math.atan2(float(direction[1]), float(direction[0]))
+                yaws[agent_id, step_id] = last_yaw
+                previous = target
+
+        return targets, yaws
+
+    def _remaining_path_for_agent(self, agent_id: int, current_xy: np.ndarray) -> np.ndarray:
+        path = self.paths_xy[agent_id]
+        waypoint_id = min(max(int(self.waypoint_ids[agent_id]), 0), len(path) - 1)
+        remaining = path[waypoint_id:]
+        if len(remaining) == 0 or np.linalg.norm(remaining[-1] - path[-1]) > 1e-5:
+            remaining = np.concatenate([remaining, path[-1:]], axis=0)
+        return np.concatenate([current_xy[None, :], remaining], axis=0).astype(np.float32)
+
+    @staticmethod
+    def _sample_path_by_distance(path: np.ndarray, distance: float) -> np.ndarray:
+        if len(path) == 0:
+            return np.zeros(2, dtype=np.float32)
+        if len(path) == 1 or distance <= 0.0:
+            return path[0].astype(np.float32)
+
+        remaining = float(distance)
+        for idx in range(len(path) - 1):
+            start = path[idx]
+            end = path[idx + 1]
+            segment = end - start
+            segment_length = float(np.linalg.norm(segment))
+            if segment_length < 1e-6:
+                continue
+            if remaining <= segment_length:
+                alpha = remaining / segment_length
+                return (start + alpha * segment).astype(np.float32)
+            remaining -= segment_length
+        return path[-1].astype(np.float32)
+
     def _dt(self) -> float:
+        return self._update_interval_steps * self._env_dt
+
+    def _should_update_navigation(self) -> bool:
+        return self.env_step_count % self._update_interval_steps == 0
+
+    def _navigation_update_hz(self) -> float:
+        return 1.0 / max(self._dt(), 1e-6)
+
+    def _compute_update_interval_steps(self, env_dt: float) -> int:
+        update_period = 1.0 / max(float(self.config.update_hz), 1e-6)
+        return max(1, int(round(update_period / max(env_dt, 1e-6))))
+
+    def _refresh_controller_dt(self) -> None:
+        if hasattr(self.sfm_controller, "dt"):
+            self.sfm_controller.dt = self._dt()
+
+    @staticmethod
+    def _read_env_dt(env) -> float:
+        env_dt = float(getattr(env, "dt", 0.0) or 0.0)
+        if env_dt > 0.0:
+            return env_dt
+        simulator = getattr(env, "simulator", None)
+        sim_dt = float(getattr(simulator, "dt", 0.0) or 0.0)
+        if sim_dt > 0.0:
+            return sim_dt
         return 1.0 / 30.0
 
     @staticmethod
@@ -898,4 +903,12 @@ class CrowdNavigationManager:
         half_yaw = 0.5 * yaw
         quat[:, 0] = torch.cos(half_yaw)
         quat[:, 3] = torch.sin(half_yaw)
+        return quat
+
+    @staticmethod
+    def _yaw_to_quat_xyzw_tensor(yaw: torch.Tensor) -> torch.Tensor:
+        quat = torch.zeros((yaw.shape[0], 4), dtype=yaw.dtype, device=yaw.device)
+        half_yaw = 0.5 * yaw
+        quat[:, 2] = torch.sin(half_yaw)
+        quat[:, 3] = torch.cos(half_yaw)
         return quat

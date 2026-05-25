@@ -19,30 +19,32 @@ class Social_Force:
         self.gain_b_agent = 0.5
         
         self.distance_field = edt
-        self.grad_map = self.compute_gradient(self.distance_field)
-    
-        self.avoid_dis = 5          # 安全作用半径
-        self.reach_dis = 2*self.rad
+        self.map_resolution = float(cfg['map'].get('resolution', 1.0))
+        self.grad_map = self.compute_gradient(self.distance_field, self.map_resolution)
+
         self.safe_dis = cfg['env']['safe_distance']
+        self.avoid_dis = float(cfg['env'].get('neighbor_radius', 4.0))
+        self.reach_dis = float(cfg['env'].get('reach_distance', 2*self.rad))
 
         self.fov = False
         
 
     @staticmethod
-    def compute_gradient(distance_field):
+    def compute_gradient(distance_field, map_resolution):
         """计算EDT的梯度场"""
-        
-        grad = np.gradient(distance_field)
-        
+        grad_y, grad_x = np.gradient(distance_field, map_resolution, map_resolution)
+        grad_world_x = grad_x
+        grad_world_y = -grad_y
+
         # 计算梯度模长
-        magnitude = np.sqrt(grad[0]**2 + grad[1]**2)
-        
+        magnitude = np.sqrt(grad_world_x**2 + grad_world_y**2)
+
         # 处理零梯度区域
         magnitude[magnitude == 0] = 1e-6  # 避免除以零
-        
+
         # 归一化梯度
-        grad_norm = grad / magnitude
-        
+        grad_norm = np.stack([grad_world_x / magnitude, grad_world_y / magnitude], axis=0)
+
         return grad_norm
     
     @staticmethod
@@ -81,7 +83,7 @@ class Social_Force:
     def compute_forces(self, agent_state, rel_obs):
         pos, cord_int, vel, goal = agent_state
         nbrs_idx, nbrs_dis, nbrs_relpos = self.fov_filter(vel, rel_obs) if self.fov else rel_obs
-        x, y = cord_int
+        pixel_y, pixel_x = cord_int
         
         # ===== 1. 计算目标吸引力 =====
         direction_to_goal = goal - pos
@@ -95,11 +97,11 @@ class Social_Force:
         
         
         # ===== 2. 计算障碍排斥力 =====
-        dist = self.distance_field[x, y]/4
+        dist = self.distance_field[pixel_y, pixel_x]
         
         if dist < self.avoid_dis:
             # 获取梯度方向
-            grad = np.array([self.grad_map[0,x,y], self.grad_map[1,x,y]])
+            grad = np.array([self.grad_map[0, pixel_y, pixel_x], self.grad_map[1, pixel_y, pixel_x]])
             
             # 排斥力计算（距离越近力越大）
             # repulsive_force = self.repulsive_gain * (1/dist - 1/self.safety_radius) * grad

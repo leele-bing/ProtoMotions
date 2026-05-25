@@ -70,6 +70,7 @@ def main() -> None:
     draw = ImageDraw.Draw(draw_overlay)
 
     resolution = float(data["map_resolution"])
+    origin_xy = tuple(data.get("map_origin_xy", default_center_origin(base.size, resolution)))
     width, height = base.size
     font = load_font()
 
@@ -81,6 +82,7 @@ def main() -> None:
             width=width,
             height=height,
             resolution=resolution,
+            origin_xy=origin_xy,
             line_width=args.line_width,
             point_radius=args.point_radius,
         )
@@ -104,6 +106,7 @@ def draw_agent(
     width: int,
     height: int,
     resolution: float,
+    origin_xy: tuple[float, float],
     line_width: int,
     point_radius: int,
 ) -> None:
@@ -113,15 +116,15 @@ def draw_agent(
     label = f"{agent_type[0].upper()}{local_id}"
     path = agent.get("path_xy", [])
     if len(path) >= 2:
-        pixels = [world_to_pixel(xy, width, height, resolution) for xy in path]
+        pixels = [world_to_pixel(xy, width, height, resolution, origin_xy) for xy in path]
         draw.line(pixels, fill=(*color, 215), width=line_width, joint="curve")
         for idx, pixel in enumerate(pixels):
             if idx == 0 or idx == len(pixels) - 1:
                 continue
             draw_circle(draw, pixel, max(2, point_radius // 3), (*color, 180), outline=None)
 
-    start_px = world_to_pixel(agent["start_xy"], width, height, resolution)
-    goal_px = world_to_pixel(agent["goal_xy"], width, height, resolution)
+    start_px = world_to_pixel(agent["start_xy"], width, height, resolution, origin_xy)
+    goal_px = world_to_pixel(agent["goal_xy"], width, height, resolution, origin_xy)
     draw_circle(draw, start_px, point_radius, (*START_COLOR, 240), outline=(0, 0, 0, 220))
     draw_circle(draw, goal_px, point_radius, (*GOAL_COLOR, 240), outline=(0, 0, 0, 220))
     draw_label(draw, font, start_px, f"{label} S", color=(255, 255, 255, 235))
@@ -129,15 +132,23 @@ def draw_agent(
 
 
 def world_to_pixel(
-    xy: list[float] | tuple[float, float], width: int, height: int, resolution: float
+    xy: list[float] | tuple[float, float],
+    width: int,
+    height: int,
+    resolution: float,
+    origin_xy: tuple[float, float],
 ) -> tuple[int, int]:
-    center_x = (width - 1) * 0.5
-    center_y = (height - 1) * 0.5
-    pixel_x = int(round(float(xy[0]) / resolution + center_x))
-    pixel_y = int(round(center_y - float(xy[1]) / resolution))
+    origin_x, origin_y = origin_xy
+    pixel_x = int(round((float(xy[0]) - origin_x) / resolution))
+    pixel_y = int(round((height - 1) - (float(xy[1]) - origin_y) / resolution))
     pixel_x = max(0, min(width - 1, pixel_x))
     pixel_y = max(0, min(height - 1, pixel_y))
     return pixel_x, pixel_y
+
+
+def default_center_origin(size: tuple[int, int], resolution: float) -> tuple[float, float]:
+    width, height = size
+    return (-0.5 * (width - 1) * resolution, -0.5 * (height - 1) * resolution)
 
 
 def draw_circle(

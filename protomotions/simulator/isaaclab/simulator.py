@@ -173,7 +173,7 @@ class IsaacLabSimulator(Simulator):
         if str(project_root) not in sys.path:
             sys.path.insert(0, str(project_root))
 
-        from CrowdSim.smpl_mesh_visualizer import ProtoMotionsHumanMeshAdapter
+        from ProtoMotions.CrowdSim.tools.smpl_mesh_visualizer import ProtoMotionsHumanMeshAdapter
 
         self._crowdsim_human_mesh = ProtoMotionsHumanMeshAdapter.from_simulator(self)
         self._crowdsim_human_mesh.create()

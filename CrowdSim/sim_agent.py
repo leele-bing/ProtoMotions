@@ -64,8 +64,6 @@ def make_crowd_robot_config(robot_cfg: dict, sensor_cfg: dict, robot_usd: str | 
     return CrowdRobotSceneConfig(
         usd_path=robot_usd,
         prim_name=robot_cfg.get("prim_name", "CrowdRobot"),
-        articulation_root_prim_path=robot_cfg.get("articulation_root_prim_path"),
-        mount_prim_path=robot_cfg.get("mount_prim_path", ""),
         init_z=float(robot_cfg.get("z", 0.0)),
         enable_camera=bool(camera_cfg.get("enabled", False)),
         camera_height=int(camera_cfg.get("height", 480)),

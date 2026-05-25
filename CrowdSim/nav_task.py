@@ -18,10 +18,12 @@ class NavigationTaskConfig:
     map_resolution: float
     free_threshold: int
     num_agents: int
+    map_origin_xy: tuple[float, float] = (0.0, 0.0)
     seed: int = 7
     min_start_goal_distance: float = 5.0
     min_spawn_spacing: float = 1.2
-    path_thin_spacing: float = 0.35
+    planning_step_size: float = 0.5
+    planning_clearance: float = 0.2
 
 
 class NavigationTask:
@@ -32,10 +34,18 @@ class NavigationTask:
         self.rng = random.Random(config.seed)
         self.free_mask, self.obstacle_map = self._load_map(config.map_path)
         self.height, self.width = self.free_mask.shape
-        self.planner = Path_Planner(self.obstacle_map, smooth=False, viz=False)
+        self.planner = Path_Planner(
+            self.obstacle_map,
+            map_resolution=config.map_resolution,
+            step_size_m=config.planning_step_size,
+            clearance_m=config.planning_clearance,
+            smooth=False,
+            viz=False,
+        )
         self.planner_free_mask = self.planner.map_dialate == 0
         self.component_labels, self.component_sizes = self._label_planner_free_space()
         self._component_pixel_cache: dict[int, np.ndarray] = {}
+        self._markers: NavigationTaskMarkers | None = None
         self.starts_px, self.goals_px = self._sample_start_goal_pixels()
         self.starts_xy = np.asarray(
             [self.pixel_to_world(px) for px in self.starts_px], dtype=np.float32
@@ -46,10 +56,11 @@ class NavigationTask:
         self.paths_xy = self._plan_paths()
 
     def world_to_pixel(self, xy: np.ndarray) -> np.ndarray:
-        center_x = (self.width - 1) * 0.5
-        center_y = (self.height - 1) * 0.5
-        pixel_x = int(round(float(xy[0]) / self.config.map_resolution + center_x))
-        pixel_y = int(round(center_y - float(xy[1]) / self.config.map_resolution))
+        origin_x, origin_y = self.config.map_origin_xy
+        pixel_x = int(round((float(xy[0]) - origin_x) / self.config.map_resolution))
+        pixel_y = int(
+            round((self.height - 1) - (float(xy[1]) - origin_y) / self.config.map_resolution)
+        )
         pixel_x = int(np.clip(pixel_x, 0, self.width - 1))
         pixel_y = int(np.clip(pixel_y, 0, self.height - 1))
         return np.array([pixel_y, pixel_x], dtype=np.int64)
@@ -57,12 +68,11 @@ class NavigationTask:
     def pixel_to_world(self, pixel_yx: np.ndarray) -> np.ndarray:
         pixel_y = float(pixel_yx[0])
         pixel_x = float(pixel_yx[1])
-        center_x = (self.width - 1) * 0.5
-        center_y = (self.height - 1) * 0.5
+        origin_x, origin_y = self.config.map_origin_xy
         return np.array(
             [
-                (pixel_x - center_x) * self.config.map_resolution,
-                (center_y - pixel_y) * self.config.map_resolution,
+                origin_x + pixel_x * self.config.map_resolution,
+                origin_y + (self.height - 1 - pixel_y) * self.config.map_resolution,
             ],
             dtype=np.float32,
         )
@@ -140,7 +150,6 @@ class NavigationTask:
             path_xy = np.asarray(
                 [self.pixel_to_world(px) for px in path_px], dtype=np.float32
             )
-            path_xy = self._thin_path(path_xy)
             paths.append(path_xy)
         return paths
 
@@ -158,14 +167,141 @@ class NavigationTask:
             ).astype(np.int64)
         return self._component_pixel_cache[component_id]
 
-    def _thin_path(self, path: np.ndarray) -> np.ndarray:
-        min_spacing = self.config.path_thin_spacing
-        if len(path) <= 2:
-            return path
+    def create_visualization_markers(self, num_humanoids: int, enabled: bool) -> None:
+        self._markers = NavigationTaskMarkers(enabled)
+        self._markers.create(self, num_humanoids)
 
-        thinned = [path[0]]
-        for point in path[1:-1]:
-            if np.linalg.norm(point - thinned[-1]) >= min_spacing:
-                thinned.append(point)
-        thinned.append(path[-1])
-        return np.asarray(thinned, dtype=np.float32)
+
+class NavigationTaskMarkers:
+    """Static IsaacLab markers for sampled starts, goals, and A* paths."""
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+        self.humanoid_start_marker = None
+        self.car_start_marker = None
+        self.humanoid_goal_marker = None
+        self.car_goal_marker = None
+        self.humanoid_path_marker = None
+        self.car_path_marker = None
+
+    def create(self, task: NavigationTask, num_humanoids: int) -> None:
+        if not self.enabled:
+            return
+
+        import isaaclab.sim as sim_utils
+        from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+
+        self.humanoid_start_marker = self._sphere_marker(
+            "/Visuals/CrowdSim/humanoid_starts",
+            sim_utils,
+            color=(0.1, 0.9, 0.2),
+        )
+        self.car_start_marker = self._sphere_marker(
+            "/Visuals/CrowdSim/car_starts",
+            sim_utils,
+            color=(0.0, 0.55, 1.0),
+        )
+        self.humanoid_goal_marker = self._sphere_marker(
+            "/Visuals/CrowdSim/humanoid_goals",
+            sim_utils,
+            color=(1.0, 0.25, 0.1),
+        )
+        self.car_goal_marker = self._sphere_marker(
+            "/Visuals/CrowdSim/car_goals",
+            sim_utils,
+            color=(1.0, 0.8, 0.0),
+        )
+        self.humanoid_path_marker = VisualizationMarkers(
+            VisualizationMarkersCfg(
+                prim_path="/Visuals/CrowdSim/humanoid_paths",
+                markers={
+                    "marker": sim_utils.SphereCfg(
+                        radius=1.0,
+                        visual_material=sim_utils.PreviewSurfaceCfg(
+                            diffuse_color=(0.9, 0.25, 0.1)
+                        ),
+                    )
+                },
+            )
+        )
+        self.car_path_marker = VisualizationMarkers(
+            VisualizationMarkersCfg(
+                prim_path="/Visuals/CrowdSim/car_paths",
+                markers={
+                    "marker": sim_utils.SphereCfg(
+                        radius=1.0,
+                        visual_material=sim_utils.PreviewSurfaceCfg(
+                            diffuse_color=(0.0, 0.9, 1.0)
+                        ),
+                    )
+                },
+            )
+        )
+
+        humanoid_slice = slice(0, num_humanoids)
+        robot_slice = slice(num_humanoids, None)
+        self._visualize_spheres(
+            self.humanoid_start_marker, task.starts_xy[humanoid_slice], z=0.06, scale=0.18
+        )
+        self._visualize_spheres(
+            self.car_start_marker, task.starts_xy[robot_slice], z=0.08, scale=0.22
+        )
+        self._visualize_spheres(
+            self.humanoid_goal_marker, task.goals_xy[humanoid_slice], z=0.06, scale=0.2
+        )
+        self._visualize_spheres(
+            self.car_goal_marker, task.goals_xy[robot_slice], z=0.08, scale=0.24
+        )
+        self._visualize_spheres(
+            self.humanoid_path_marker,
+            self._flatten_paths(task.paths_xy[humanoid_slice]),
+            z=0.035,
+            scale=0.055,
+        )
+        self._visualize_spheres(
+            self.car_path_marker,
+            self._flatten_paths(task.paths_xy[robot_slice]),
+            z=0.045,
+            scale=0.065,
+        )
+
+    @staticmethod
+    def _sphere_marker(prim_path: str, sim_utils, color: tuple[float, float, float]):
+        from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+
+        return VisualizationMarkers(
+            VisualizationMarkersCfg(
+                prim_path=prim_path,
+                markers={
+                    "marker": sim_utils.SphereCfg(
+                        radius=1.0,
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
+                    )
+                },
+            )
+        )
+
+    def _visualize_spheres(self, marker, xy: np.ndarray, z: float, scale: float) -> None:
+        if marker is None or len(xy) == 0:
+            return
+        translations = np.zeros((len(xy), 3), dtype=np.float32)
+        translations[:, :2] = xy
+        translations[:, 2] = z
+        orientations = np.zeros((len(xy), 4), dtype=np.float32)
+        orientations[:, 0] = 1.0
+        scales = np.full((len(xy), 3), scale, dtype=np.float32)
+        marker.visualize(
+            translations=translations,
+            orientations=orientations,
+            scales=scales,
+        )
+
+    @staticmethod
+    def _flatten_paths(paths_xy) -> np.ndarray:
+        paths = list(paths_xy)
+        if not paths:
+            return np.zeros((0, 2), dtype=np.float32)
+        non_empty = [path for path in paths if len(path) > 0]
+        if not non_empty:
+            return np.zeros((0, 2), dtype=np.float32)
+        return np.concatenate(non_empty, axis=0).astype(np.float32)

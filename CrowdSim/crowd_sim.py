@@ -17,8 +17,13 @@ AppLauncher = import_simulator_before_torch("isaaclab")
 
 import torch  # noqa: E402
 
+from CrowdSim.utils.humanoid_state_recorder import (  # noqa: E402
+    HumanoidStateRecorderConfig,
+    configure_humanoid_state_recorder,
+)
+from CrowdSim.utils.map_metadata import OccupancyMapMetadata, load_occupancy_map_metadata  # noqa: E402
 from CrowdSim.navigation import CrowdNavigationConfig, CrowdNavigationManager  # noqa: E402
-from CrowdSim.sensor_stream import (  # noqa: E402
+from CrowdSim.utils.sensor_stream import (  # noqa: E402
     RobotCameraStreamConfig,
     configure_robot_camera_recorder,
 )
@@ -48,7 +53,13 @@ def parse_args() -> argparse.Namespace:
         description="Run CrowdSim from a YAML config.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--config", default="CrowdSim/config/cfg.yaml")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Environment config path. Kept as a compatibility alias for --env-config.",
+    )
+    parser.add_argument("--env-config", default="CrowdSim/config/env.yaml")
+    parser.add_argument("--ppo-config", default="CrowdSim/config/ppo.yaml")
     parser.add_argument("--num-envs", type=int, default=4)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--full-eval", action="store_true")
@@ -90,7 +101,7 @@ def load_config(path: Path) -> dict[str, Any]:
 
 
 def parse_scalar(value: str):
-    text = value.strip()
+    text = strip_inline_comment(value).strip()
     if (text.startswith('"') and text.endswith('"')) or (
         text.startswith("'") and text.endswith("'")
     ):
@@ -119,6 +130,19 @@ def parse_scalar(value: str):
         return text
 
 
+def strip_inline_comment(value: str) -> str:
+    quote: str | None = None
+    for idx, char in enumerate(value):
+        if char in {"'", '"'}:
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+        elif char == "#" and quote is None:
+            return value[:idx]
+    return value
+
+
 def cfg_path(path_like: str) -> Path:
     path = Path(path_like).expanduser()
     if path.is_absolute():
@@ -128,7 +152,10 @@ def cfg_path(path_like: str) -> Path:
 
 def main() -> None:
     args = parse_args()
-    config = load_config(cfg_path(args.config))
+    config = load_config(cfg_path(args.config or args.env_config))
+    ppo_config_path = cfg_path(args.ppo_config)
+    if ppo_config_path.exists():
+        merge_ppo_config(config, load_config(ppo_config_path))
     scene_cfg = config.get("scene", {})
     humanoid_cfg = config.get("humanoid", {})
     car_cfg = config.get("car", {})
@@ -137,13 +164,14 @@ def main() -> None:
     checkpoint = resolve_repo_path(humanoid_cfg["checkpoint"])
     motion_file = resolve_repo_path(humanoid_cfg["motion_file"])
     scene_usd = resolve_repo_path(scene_cfg["scene_usd"])
-    scene_map = resolve_repo_path(scene_cfg["scene_map"])
+    scene_map_ref = resolve_repo_path(scene_cfg["scene_map"])
+    map_metadata = load_occupancy_map_metadata(scene_map_ref)
     validate_paths(
         {
             "Checkpoint": checkpoint,
             "Motion file": motion_file,
             "Scene USD": scene_usd,
-            "Scene map": scene_map,
+            "Scene map image": map_metadata.image_path,
         }
     )
 
@@ -183,12 +211,13 @@ def main() -> None:
     )
     env = runtime.env
     configure_viewer_camera(env, config.get("viewer", {}), args.headless)
+    configure_humanoid_state_recording(env, config)
 
     if not scene_loaded_in_scene_cfg:
         add_global_usd_reference(scene_usd, prim_path=scene_prim_path, z_offset=scene_z_offset)
 
     nav_manager = build_navigation_manager(
-        scene_map=scene_map,
+        map_metadata=map_metadata,
         num_humanoids=env.num_envs,
         num_robots=env.num_envs if crowd_robot_config is not None else 0,
         device=fabric.device,
@@ -199,7 +228,9 @@ def main() -> None:
         spawn_xy = nav_manager.humanoid_starts_xy
         print(f"[CrowdSim] Navigation humanoid starts: {spawn_xy.cpu().tolist()}")
     else:
-        spawn_xy = sample_or_parse_humanoid_spawns(scene_map, env.num_envs, fabric.device, config)
+        spawn_xy = sample_or_parse_humanoid_spawns(
+            map_metadata, env.num_envs, fabric.device, config
+        )
     apply_fixed_spawn_offsets(env, spawn_xy)
 
     if crowd_robot_config is not None:
@@ -208,7 +239,7 @@ def main() -> None:
             print(f"[CrowdSim] Navigation robot starts: {robot_spawn_xy_yaw.cpu().tolist()}")
         else:
             robot_spawn_xy_yaw = sample_or_parse_car_spawns(
-                scene_map, env.num_envs, fabric.device, config
+                map_metadata, env.num_envs, fabric.device, config
             )
         apply_fixed_crowd_robot_spawns(env, robot_spawn_xy_yaw)
         configure_robot_camera_recorder(
@@ -229,7 +260,7 @@ def main() -> None:
     if args.full_eval:
         runtime.agent.evaluator.eval_count = 0
         print(runtime.agent.evaluator.evaluate())
-    elif nav_manager is not None and nav_manager.config.local_controller == "rl":
+    elif nav_manager is not None and nav_manager.config.robot_control_mode.lower() == "rl":
         run_masked_mimic_with_robot_ppo(runtime, nav_manager, config)
     else:
         runtime.agent.evaluator.simple_test_policy(collect_metrics=True)
@@ -241,55 +272,76 @@ def validate_paths(paths: dict[str, Path]) -> None:
             raise FileNotFoundError(f"{label} not found: {path}")
 
 
+def configure_humanoid_state_recording(env, cfg: dict[str, Any]):
+    record_cfg = cfg.get("humanoid", {}).get("state_recording", {})
+    if not isinstance(record_cfg, dict) or not bool(record_cfg.get("enabled", False)):
+        return None
+
+    return configure_humanoid_state_recorder(
+        env,
+        HumanoidStateRecorderConfig(
+            output_dir=resolve_repo_path(
+                record_cfg.get("record_dir", "output/crowdsim_humanoid_state")
+            ),
+            fps=float(record_cfg.get("record_fps", 30.0)),
+            env_ids=str(record_cfg.get("record_envs", "0")),
+            auto_record=bool(record_cfg.get("auto_record", False)),
+            key=str(record_cfg.get("key", "H")),
+        ),
+    )
+
+
 def sample_or_parse_humanoid_spawns(
-    scene_map: Path,
+    map_metadata: OccupancyMapMetadata,
     num_envs: int,
     device: torch.device,
     cfg: dict[str, Any],
 ) -> torch.Tensor:
     humanoid_cfg = cfg.get("humanoid", {})
+    path_cfg = cfg.get("navigation", {}).get("path", {})
     if humanoid_cfg.get("spawn_xy"):
         spawn_xy = parse_spawn_xy(humanoid_cfg["spawn_xy"], num_envs, device)
         print(f"[CrowdSim] Using manual humanoid spawn XY: {spawn_xy.cpu().tolist()}")
         return spawn_xy
 
-    scene_cfg = cfg.get("scene", {})
     spawn_xy = sample_spawn_xy_from_map(
-        map_path=scene_map,
+        map_path=map_metadata.image_path,
         num_envs=num_envs,
         device=device,
-        map_resolution=float(scene_cfg.get("resolution", 0.05002501250625312)),
-        humanoid_radius=float(humanoid_cfg.get("radius", 0.45)),
-        min_spacing=float(humanoid_cfg.get("spacing", 0.9)),
-        free_threshold=int(scene_cfg.get("free_threshold", 200)),
-        seed=int(humanoid_cfg.get("spawn_seed", 0)),
+        map_resolution=map_metadata.resolution,
+        map_origin_xy=map_metadata.origin_xy,
+        humanoid_radius=float(path_cfg.get("planning_clearance", 0.2)),
+        min_spacing=float(path_cfg.get("min_spawn_spacing", 1.2)),
+        free_threshold=map_metadata.free_threshold,
+        seed=int(path_cfg.get("seed", 7)),
     )
     print(f"[CrowdSim] Sampled humanoid spawn XY: {spawn_xy.cpu().tolist()}")
     return spawn_xy
 
 
 def sample_or_parse_car_spawns(
-    scene_map: Path,
+    map_metadata: OccupancyMapMetadata,
     num_envs: int,
     device: torch.device,
     cfg: dict[str, Any],
 ) -> torch.Tensor:
     car_cfg = cfg.get("car", {})
+    path_cfg = cfg.get("navigation", {}).get("path", {})
     if car_cfg.get("spawn_xy"):
         spawn_xy_yaw = parse_spawn_xy_yaw(car_cfg["spawn_xy"], num_envs, device)
         print(f"[CrowdSim] Using manual car spawn XY/yaw: {spawn_xy_yaw.cpu().tolist()}")
         return spawn_xy_yaw
 
-    scene_cfg = cfg.get("scene", {})
     spawn_xy = sample_spawn_xy_from_map(
-        map_path=scene_map,
+        map_path=map_metadata.image_path,
         num_envs=num_envs,
         device=device,
-        map_resolution=float(scene_cfg.get("resolution", 0.05002501250625312)),
-        humanoid_radius=float(car_cfg.get("radius", 0.35)),
-        min_spacing=float(car_cfg.get("spacing", 1.2)),
-        free_threshold=int(scene_cfg.get("free_threshold", 200)),
-        seed=int(car_cfg.get("spawn_seed", 1)),
+        map_resolution=map_metadata.resolution,
+        map_origin_xy=map_metadata.origin_xy,
+        humanoid_radius=float(path_cfg.get("planning_clearance", 0.2)),
+        min_spacing=float(path_cfg.get("min_spawn_spacing", 1.2)),
+        free_threshold=map_metadata.free_threshold,
+        seed=int(path_cfg.get("seed", 7)) + 1,
     )
     spawn_xy_yaw = torch.zeros(num_envs, 3, dtype=torch.float32, device=device)
     spawn_xy_yaw[:, :2] = spawn_xy
@@ -298,7 +350,7 @@ def sample_or_parse_car_spawns(
 
 
 def build_navigation_manager(
-    scene_map: Path,
+    map_metadata: OccupancyMapMetadata,
     num_humanoids: int,
     num_robots: int,
     device: torch.device,
@@ -308,46 +360,48 @@ def build_navigation_manager(
     if not bool(nav_cfg.get("enabled", False)):
         return None
 
-    scene_cfg = cfg.get("scene", {})
-    humanoid_cfg = cfg.get("humanoid", {})
-    car_cfg = cfg.get("car", {})
     path_cfg = nav_cfg.get("path", {})
-    marker_cfg = nav_cfg.get("markers", {})
-    rl_cfg = nav_cfg.get("rl", {})
+    local_cfg = nav_cfg.get("local", {})
+    recording_cfg = nav_cfg.get("recording", {})
+    humanoid_cfg = cfg.get("humanoid", {})
+    marker_cfg = get_marker_config(cfg)
+    rl_cfg = get_robot_rl_config(cfg)
     config = CrowdNavigationConfig(
-        map_path=scene_map,
-        map_resolution=float(scene_cfg.get("resolution", 0.05002501250625312)),
-        free_threshold=int(scene_cfg.get("free_threshold", 200)),
+        map_path=map_metadata.image_path,
+        map_resolution=map_metadata.resolution,
+        free_threshold=map_metadata.free_threshold,
+        map_origin_xy=map_metadata.origin_xy,
         num_humanoids=num_humanoids,
         num_robots=num_robots,
         device=device,
         seed=int(path_cfg.get("seed", 7)),
-        local_controller=str(nav_cfg.get("local_controller", "orca")),
-        agent_radius=float(nav_cfg.get("agent_radius", 0.35)),
-        humanoid_radius=float(humanoid_cfg.get("radius", 0.45)),
-        safe_distance=float(nav_cfg.get("safe_distance", 0.25)),
-        max_speed=float(nav_cfg.get("max_speed", 0.8)),
+        robot_control_mode=str(local_cfg.get("method", "sfm")),
+        agent_radius=float(local_cfg.get("agent_radius", 0.35)),
+        safe_distance=float(local_cfg.get("safe_distance", 0.75)),
+        max_speed=float(local_cfg.get("max_speed", 1.5)),
         waypoint_tolerance=float(nav_cfg.get("waypoint_tolerance", 0.45)),
         goal_tolerance=float(nav_cfg.get("goal_tolerance", 0.75)),
         min_start_goal_distance=float(path_cfg.get("min_start_goal_distance", 5.0)),
         min_spawn_spacing=float(path_cfg.get("min_spawn_spacing", 1.2)),
-        neighbor_radius=float(nav_cfg.get("neighbor_radius", 4.0)),
-        obstacle_query_radius=int(nav_cfg.get("obstacle_query_radius", 14)),
-        max_obstacles=int(nav_cfg.get("max_obstacles", 16)),
+        planning_step_size=float(path_cfg.get("planning_step_size", 0.5)),
+        planning_clearance=float(path_cfg.get("planning_clearance", 0.2)),
+        neighbor_radius=float(local_cfg.get("neighbor_radius", 4.0)),
         collision_distance=float(nav_cfg.get("collision_distance", 0.75)),
         log_interval=int(nav_cfg.get("log_interval", 120)),
-        path_thin_spacing=float(path_cfg.get("path_thin_spacing", 0.35)),
-        wheel_radius=float(car_cfg.get("wheel_radius", 0.0325)),
-        wheel_base=float(car_cfg.get("wheel_base", 0.118)),
-        max_wheel_speed=float(car_cfg.get("max_wheel_speed", 12.0)),
-        heading_gain=float(car_cfg.get("heading_gain", 2.5)),
-        wheel_joint_indices=parse_optional_int_pair(car_cfg.get("wheel_joint_indices")),
+        update_hz=float(nav_cfg.get("update_hz", 30.0)),
+        trajectory_recording_enabled=bool(recording_cfg.get("enabled", True)),
+        trajectory_output_dir=resolve_repo_path(
+            recording_cfg.get("output_dir", "output/crowdsim_navigation")
+        ),
         visual_markers_enabled=bool(marker_cfg.get("enabled", False)),
-        marker_update_interval=max(1, int(marker_cfg.get("update_interval", 10))),
+        humanoid_target_enabled=bool(humanoid_cfg.get("target_enabled", True)),
+        local_target_timestep=float(local_cfg.get("target_timestep", 1.0)),
+        humanoid_target_min_heading_speed=float(
+            humanoid_cfg.get("min_heading_speed", 0.05)
+        ),
         rl_num_neighbors=int(rl_cfg.get("num_neighbors", 4)),
         rl_num_obstacles=int(rl_cfg.get("num_obstacles", 8)),
         rl_obstacle_radius=float(rl_cfg.get("obstacle_radius", 4.0)),
-        rl_action_yaw_rate=float(rl_cfg.get("action_yaw_rate", 2.5)),
         rl_progress_reward_scale=float(rl_cfg.get("progress_reward_scale", 4.0)),
         rl_goal_reward=float(rl_cfg.get("goal_reward", 10.0)),
         rl_collision_penalty=float(rl_cfg.get("collision_penalty", -10.0)),
@@ -357,27 +411,16 @@ def build_navigation_manager(
     return CrowdNavigationManager(config)
 
 
-def parse_optional_int_pair(value) -> tuple[int, int] | None:
-    if value is None:
-        return None
-    if isinstance(value, str) and value.lower() in {"none", "null", ""}:
-        return None
-    items = list(value)
-    if len(items) != 2:
-        raise ValueError("wheel_joint_indices must be null or a two-item list.")
-    return (int(items[0]), int(items[1]))
-
-
 def run_masked_mimic_with_robot_ppo(
     runtime,
     nav_manager: CrowdNavigationManager,
     cfg: dict[str, Any],
 ) -> None:
-    rl_cfg = cfg.get("navigation", {}).get("rl", {})
+    rl_cfg = get_robot_rl_config(cfg)
     checkpoint = rl_cfg.get("policy_checkpoint")
     if checkpoint is None:
         raise RuntimeError(
-            "navigation.local_controller is 'rl', but navigation.rl.policy_checkpoint is not set. "
+            "navigation.local.method is 'rl', but rl.policy_checkpoint is not set in the PPO config. "
             "Train a policy with CrowdSim/train_robot_ppo.py first, then point this field at the checkpoint."
         )
 
@@ -423,6 +466,25 @@ def run_masked_mimic_with_robot_ppo(
             step += 1
     except KeyboardInterrupt:
         print(f"\nStopped after {step} steps.")
+
+
+def merge_ppo_config(env_cfg: dict[str, Any], ppo_cfg: dict[str, Any]) -> None:
+    rl_cfg = ppo_cfg.get("rl", ppo_cfg)
+    if not isinstance(rl_cfg, dict):
+        return
+    env_cfg.setdefault("navigation", {})["rl"] = rl_cfg
+
+
+def get_robot_rl_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    nav_cfg = cfg.get("navigation", {})
+    rl_cfg = nav_cfg.get("rl", cfg.get("rl", {}))
+    return rl_cfg if isinstance(rl_cfg, dict) else {}
+
+
+def get_marker_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    nav_cfg = cfg.get("navigation", {})
+    marker_cfg = cfg.get("markers", nav_cfg.get("markers", {}))
+    return marker_cfg if isinstance(marker_cfg, dict) else {}
 
 
 if __name__ == "__main__":

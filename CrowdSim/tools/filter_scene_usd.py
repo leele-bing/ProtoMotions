@@ -1,13 +1,12 @@
-"""Create a filtered USD scene by removing or deactivating keyword-matched prims."""
+"""Create a filtered USD scene by deactivating/removing keyword-matched prims."""
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 import sys
-from typing import Any
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -18,18 +17,21 @@ AppLauncher = import_simulator_before_torch("isaaclab")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Filter a USD scene using CrowdSim scene_visual keywords.",
+        description="Filter a USD scene using keyword-matched prim paths.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--config", default="CrowdSim/config/cfg.yaml")
-    parser.add_argument("--input-usd", default=None)
-    parser.add_argument("--output-usd", default=None)
-    parser.add_argument("--root-prim", default=None)
-    parser.add_argument("--keywords", nargs="*", default=None)
+    parser.add_argument("--input-usd", default="/home/pcl/amp/Assets/Office/office.usd")
+    parser.add_argument("--output-usd", default="/home/pcl/amp/Assets/Office/office_removed.usd")
+    parser.add_argument(
+        "--root-prim",
+        default=None,
+        help="Optional prim path to search under. Defaults to auto-detecting the scene root.",
+    )
+    parser.add_argument("--keywords", nargs="+", required=True)
     parser.add_argument(
         "--mode",
         choices=("remove", "deactivate"),
-        default="remove",
+        default="deactivate",
         help="remove deletes matched prims; deactivate authors active=false opinions.",
     )
     parser.add_argument("--dry-run", action="store_true")
@@ -38,16 +40,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    cfg = load_config(resolve_project_path(args.config))
-    scene_cfg = cfg.get("scene", {})
-    visual_cfg = scene_cfg.get("scene_visual", {})
-
-    input_usd = resolve_project_path(args.input_usd or scene_cfg["scene_usd"])
-    output_usd = resolve_project_path(args.output_usd) if args.output_usd else default_output_path(input_usd)
-    root_prim = str(args.root_prim or scene_cfg.get("prim_path", "/World/Scene"))
-    keywords = tuple(args.keywords or visual_cfg.get("deactivate_keywords", []))
-    if not keywords:
-        raise ValueError("No keywords provided. Set scene.scene_visual.deactivate_keywords or pass --keywords.")
+    input_usd = resolve_path(args.input_usd)
+    output_usd = resolve_path(args.output_usd) if args.output_usd else default_output_path(input_usd)
+    root_prim = str(args.root_prim) if args.root_prim else None
+    keywords = tuple(args.keywords)
 
     app_launcher = AppLauncher({"headless": True})
     try:
@@ -74,7 +70,7 @@ def main() -> None:
 def filter_usd_scene(
     input_usd: Path,
     output_usd: Path,
-    root_prim_path: str,
+    root_prim_path: str | None,
     keywords: tuple[str, ...],
     mode: str,
     dry_run: bool,
@@ -92,11 +88,16 @@ def filter_usd_scene(
     stage_utils.update_stage()
 
     stage = omni.usd.get_context().get_stage()
-    root_prim = stage.GetPrimAtPath(root_prim_path)
-    if not root_prim.IsValid():
+    if root_prim_path is None:
         root_prim_path = find_first_scene_root(stage)
         root_prim = stage.GetPrimAtPath(root_prim_path)
-        print(f"[CrowdSim] Root prim not found; using {root_prim_path}")
+        print(f"[CrowdSim] Auto-detected root prim: {root_prim_path}")
+    else:
+        root_prim = stage.GetPrimAtPath(root_prim_path)
+        if not root_prim.IsValid():
+            root_prim_path = find_first_scene_root(stage)
+            root_prim = stage.GetPrimAtPath(root_prim_path)
+            print(f"[CrowdSim] Root prim not found; using {root_prim_path}")
 
     matched = find_keyword_matched_prims(stage, root_prim, keywords)
     if dry_run:
@@ -150,7 +151,7 @@ def prune_descendants(paths: list[str]) -> list[str]:
 def find_first_scene_root(stage) -> str:
     pseudo_root = stage.GetPseudoRoot()
     children = [str(child.GetPath()) for child in pseudo_root.GetChildren()]
-    for candidate in ("/World", "/Environment", "/Scene"):
+    for candidate in ("/Root", "/World", "/Environment", "/Scene"):
         if stage.GetPrimAtPath(candidate).IsValid():
             return candidate
     if children:
@@ -160,71 +161,14 @@ def find_first_scene_root(stage) -> str:
 
 def default_output_path(input_usd: Path) -> Path:
     suffix = input_usd.suffix or ".usd"
-    return input_usd.with_name(f"{input_usd.stem}_removed{suffix}")
+    return input_usd.with_name(f"{input_usd.stem}_filtered{suffix}")
 
 
-def load_config(path: Path) -> dict[str, Any]:
-    root: dict[str, Any] = {}
-    stack: list[tuple[int, dict[str, Any]]] = [(-1, root)]
-    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
-            continue
-        indent = len(raw_line) - len(raw_line.lstrip(" "))
-        stripped = raw_line.strip()
-        if ":" not in stripped:
-            raise ValueError(f"Invalid config line {line_number}: {raw_line}")
-        key, raw_value = stripped.split(":", maxsplit=1)
-        key = key.strip()
-        raw_value = raw_value.strip()
-        while stack and indent <= stack[-1][0]:
-            stack.pop()
-        if not stack:
-            raise ValueError(f"Invalid indentation at line {line_number}: {raw_line}")
-        parent = stack[-1][1]
-        if raw_value == "":
-            child: dict[str, Any] = {}
-            parent[key] = child
-            stack.append((indent, child))
-        else:
-            parent[key] = parse_scalar(raw_value)
-    return root
-
-
-def parse_scalar(value: str):
-    text = value.strip()
-    if (text.startswith('"') and text.endswith('"')) or (
-        text.startswith("'") and text.endswith("'")
-    ):
-        return text[1:-1]
-    lowered = text.lower()
-    if lowered in {"none", "null"}:
-        return None
-    if lowered == "true":
-        return True
-    if lowered == "false":
-        return False
-    if text.startswith("[") and text.endswith("]"):
-        inner = text[1:-1].strip()
-        if not inner:
-            return []
-        return [parse_scalar(item.strip()) for item in inner.split(",")]
-    if "," in text:
-        return [parse_scalar(item) for item in text.split(",")]
-    try:
-        return int(text)
-    except ValueError:
-        pass
-    try:
-        return float(text)
-    except ValueError:
-        return text
-
-
-def resolve_project_path(path_like: str | Path) -> Path:
+def resolve_path(path_like: str | Path) -> Path:
     path = Path(path_like).expanduser()
     if path.is_absolute():
         return path.resolve()
-    return (PROJECT_ROOT / path).resolve()
+    return (Path.cwd() / path).resolve()
 
 
 if __name__ == "__main__":

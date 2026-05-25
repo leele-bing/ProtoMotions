@@ -9,8 +9,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from CrowdSim.utils.map_metadata import DEFAULT_FREE_THRESHOLD, DEFAULT_MAP_RESOLUTION
 
-DEFAULT_SCENE_MAP_RESOLUTION = 100.0 / 1999.0
+
+DEFAULT_SCENE_MAP_RESOLUTION = DEFAULT_MAP_RESOLUTION
 DEFAULT_OFFICE_MAP_RESOLUTION = DEFAULT_SCENE_MAP_RESOLUTION
 
 
@@ -20,8 +22,6 @@ class CrowdRobotSceneConfig:
 
     usd_path: str
     prim_name: str = "CrowdRobot"
-    articulation_root_prim_path: str | None = None
-    mount_prim_path: str = ""
     init_z: float = 0.0
     enable_camera: bool = False
     camera_height: int = 480
@@ -93,17 +93,17 @@ def sample_spawn_xy_from_map(
     num_envs: int,
     device: torch.device,
     map_resolution: float = DEFAULT_SCENE_MAP_RESOLUTION,
+    map_origin_xy: tuple[float, float] | None = None,
     humanoid_radius: float = 0.45,
     min_spacing: float = 0.9,
-    free_threshold: int = 200,
+    free_threshold: int = DEFAULT_FREE_THRESHOLD,
     seed: int = 0,
 ) -> torch.Tensor:
     """Sample initial XY positions from an occupancy image.
 
-    The image center is world (0, 0). Image +x maps to world +x, and image -y
-    maps to world +y. The default resolution matches a 3999x3999 map exported
-    with stage X/Y bounds [-100, 100]. By default, white pixels are treated as
-    free space and dark/gray pixels as obstacles or unknown area.
+    Image +x maps to world +x, and image -y maps to world +y. If a map origin is
+    provided from an occupancy-map YAML, it is used as the lower-left pixel
+    center. Otherwise the historical centered-map convention is used.
     """
     if map_resolution <= 0:
         raise ValueError(f"map_resolution must be positive, got {map_resolution}")
@@ -117,6 +117,14 @@ def sample_spawn_xy_from_map(
     grid = np.asarray(image, dtype=np.uint8)
     free = grid >= int(free_threshold)
     height, width = free.shape
+    origin_xy = (
+        map_origin_xy
+        if map_origin_xy is not None
+        else (
+            -0.5 * (width - 1) * map_resolution,
+            -0.5 * (height - 1) * map_resolution,
+        )
+    )
     if not free.any():
         print(f"[CrowdSim] Warning: no free pixels found in {map_path}; using fallback grid.")
         return _fallback_spawn_grid(num_envs, device, min_spacing)
@@ -153,12 +161,15 @@ def sample_spawn_xy_from_map(
             f"free spawn points in {map_path}; filling remaining points with fallback grid."
         )
         fallback = _fallback_spawn_grid(num_envs - len(selected_pixels), device, min_spacing)
-        selected_xy = [_pixel_to_world(px, py, width, height, map_resolution) for px, py in selected_pixels]
+        selected_xy = [
+            _pixel_to_world(px, py, width, height, map_resolution, origin_xy)
+            for px, py in selected_pixels
+        ]
         selected_xy.extend((float(x), float(y)) for x, y in fallback.cpu().tolist())
         return torch.tensor(selected_xy[:num_envs], dtype=torch.float32, device=device)
 
     selected_xy = [
-        _pixel_to_world(px, py, width, height, map_resolution)
+        _pixel_to_world(px, py, width, height, map_resolution, origin_xy)
         for px, py in selected_pixels[:num_envs]
     ]
     print(
@@ -169,12 +180,17 @@ def sample_spawn_xy_from_map(
 
 
 def _pixel_to_world(
-    pixel_x: int, pixel_y: int, width: int, height: int, resolution: float
+    pixel_x: int,
+    pixel_y: int,
+    width: int,
+    height: int,
+    resolution: float,
+    origin_xy: tuple[float, float],
 ) -> tuple[float, float]:
-    center_x = (width - 1) * 0.5
-    center_y = (height - 1) * 0.5
-    world_x = (pixel_x - center_x) * resolution
-    world_y = (center_y - pixel_y) * resolution
+    del width
+    origin_x, origin_y = origin_xy
+    world_x = origin_x + pixel_x * resolution
+    world_y = origin_y + (height - 1 - pixel_y) * resolution
     return world_x, world_y
 
 
@@ -338,7 +354,6 @@ def patch_isaaclab_scene_with_crowdsim_assets(
                         enabled_self_collisions=False
                     ),
                 ),
-                articulation_root_prim_path=crowd_robot.articulation_root_prim_path,
                 init_state=ArticulationCfg.InitialStateCfg(
                     pos=(0.0, 0.0, crowd_robot.init_z),
                     joint_pos={".*": 0.0},
@@ -353,10 +368,9 @@ def patch_isaaclab_scene_with_crowdsim_assets(
                 },
             )
 
-            sensor_mount_path = _join_prim_path(robot_prim_path, crowd_robot.mount_prim_path)
             if crowd_robot.enable_camera:
                 self.crowdsim_robot_camera = CameraCfg(
-                    prim_path=f"{sensor_mount_path}/front_cam",
+                    prim_path=f"{robot_prim_path}/front_cam",
                     update_period=crowd_robot.camera_update_period,
                     height=crowd_robot.camera_height,
                     width=crowd_robot.camera_width,
@@ -376,7 +390,7 @@ def patch_isaaclab_scene_with_crowdsim_assets(
 
             if crowd_robot.enable_lidar:
                 self.crowdsim_robot_lidar = RayCasterCfg(
-                    prim_path=sensor_mount_path,
+                    prim_path=robot_prim_path,
                     update_period=crowd_robot.lidar_update_period,
                     offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, crowd_robot.lidar_z_offset)),
                     mesh_prim_paths=list(crowd_robot.lidar_mesh_prim_paths),
@@ -397,13 +411,6 @@ def patch_isaaclab_scene_with_crowdsim_assets(
                 )
 
     simulator_module.SceneCfg = CrowdSimSceneCfg
-
-
-def _join_prim_path(root: str, child: str) -> str:
-    child = child.strip("/")
-    if not child:
-        return root
-    return f"{root}/{child}"
 
 
 def apply_fixed_spawn_offsets(env, spawn_xy: torch.Tensor) -> None:
