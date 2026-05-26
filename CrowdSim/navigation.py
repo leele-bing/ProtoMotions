@@ -31,7 +31,6 @@ class CrowdNavigationConfig:
     device: torch.device
     map_origin_xy: tuple[float, float] = (0.0, 0.0)
     seed: int = 7
-    robot_control_mode: str = "sfm"
     agent_radius: float = 0.35
     safe_distance: float = 0.75
     max_speed: float = 1.5
@@ -53,7 +52,10 @@ class CrowdNavigationConfig:
     humanoid_target_enabled: bool = True
     local_target_timestep: float = 1.0
     humanoid_target_min_heading_speed: float = 0.05
+    car_rl_policy: bool = True
     rl_num_neighbors: int = 4
+    rl_max_linear_velocity: float = 2.0
+    rl_max_angular_velocity: float = 2.0
     rl_progress_reward_scale: float = 4.0
     rl_goal_reward: float = 10.0
     rl_collision_penalty: float = -10.0
@@ -111,15 +113,15 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
         self._last_positions = self.starts_xy.copy()
         self._has_completed_initial_reset = False
         self._wheel_targets_tensor: torch.Tensor | None = None
-        self._joint_velocity_targets: torch.Tensor | None = None
-        self._left_wheel_joint_ids: torch.Tensor | None = None
-        self._right_wheel_joint_ids: torch.Tensor | None = None
+        self._wheel_joint_ids: list[int] | None = None
         self._wheel_controller = ManualDifferentialController(config.differential_drive)
         self._sfm_waypoints = self.starts_xy.copy().astype(np.float32)
         self._humanoid_sfm_waypoints = self.starts_xy[: config.num_humanoids].copy().astype(np.float32)
         self._robot_sfm_waypoints = self.starts_xy[
             config.num_humanoids : config.num_humanoids + config.num_robots
         ].copy().astype(np.float32)
+        self._robot_progress_targets = self._robot_sfm_waypoints.copy().astype(np.float32)
+        self._robot_prev_progress_dist = np.zeros(config.num_robots, dtype=np.float32)
         self._sfm_desired_velocities = np.zeros((self.num_agents, 2), dtype=np.float32)
         self._sfm_interact_forces = np.zeros((self.num_agents, 2), dtype=np.float32)
         self._sfm_repulsive_forces = np.zeros((self.num_agents, 2), dtype=np.float32)
@@ -135,15 +137,9 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
         self.path_log_path = self._write_navigation_path_log()
         self.trajectory_log_path = self._open_trajectory_log()
 
-        controller_mode = config.robot_control_mode.lower()
-        if controller_mode not in {"sfm", "rl"}:
-            raise ValueError(
-                f"Unsupported navigation.local.method: {config.robot_control_mode}"
-            )
         self.sfm_controller = self._make_sfm_controller(config.agent_radius)
 
         self._robot_rl_actions = np.zeros((config.num_robots, 2), dtype=np.float32)
-        self._robot_prev_goal_dist = self._robot_goal_distances(self.starts_xy)
         self._robot_episode_steps = np.zeros(config.num_robots, dtype=np.int64)
         self._robot_last_obs: torch.Tensor | None = None
         self._robot_last_rewards = torch.zeros(config.num_robots, device=config.device)
@@ -172,21 +168,54 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
         if self.config.num_robots > 0 and self.robot is None:
             raise RuntimeError("Navigation requested robot control, but crowdsim_robot is missing.")
         if self.config.num_robots > 0:
-            num_joints = self._num_robot_joints()
-            self._configure_robot_wheel_joints()
+            available_joint_names = list(
+                getattr(self.robot, "joint_names", None)
+                or getattr(self.robot.data, "joint_names", [])
+                or []
+            )
+            try:
+                left_ids, left_names = self.robot.find_joints(
+                    list(self.config.differential_drive.left_wheel_joint_names),
+                    preserve_order=True,
+                )
+                right_ids, right_names = self.robot.find_joints(
+                    list(self.config.differential_drive.right_wheel_joint_names),
+                    preserve_order=True,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to resolve fixed robot wheel joints. "
+                    f"Expected left={self.config.differential_drive.left_wheel_joint_names}, "
+                    f"right={self.config.differential_drive.right_wheel_joint_names}. "
+                    f"Available joints: {available_joint_names}"
+                ) from exc
+            if not left_ids or not right_ids:
+                raise RuntimeError(
+                    "Failed to resolve fixed robot wheel joints. "
+                    f"Expected left={self.config.differential_drive.left_wheel_joint_names}, "
+                    f"right={self.config.differential_drive.right_wheel_joint_names}. "
+                    f"Available joints: {available_joint_names}"
+                )
+            if len(left_ids) != 1 or len(right_ids) != 1:
+                raise RuntimeError(
+                    "Expected exactly one left wheel joint and one right wheel joint for "
+                    "IsaacLab Articulation velocity control. "
+                    f"Resolved left={list(zip(left_ids, left_names))}, "
+                    f"right={list(zip(right_ids, right_names))}."
+                )
+
+            self._wheel_joint_ids = [int(left_ids[0]), int(right_ids[0])]
             self._wheel_targets_tensor = torch.zeros(
                 self.config.num_robots,
                 2,
                 dtype=torch.float32,
                 device=self.config.device,
             )
-            if self.config.differential_drive.wheel_joint_indices is None and num_joints != 2:
-                self._joint_velocity_targets = torch.zeros(
-                    self.config.num_robots,
-                    num_joints,
-                    dtype=torch.float32,
-                    device=self.config.device,
-                )
+            print(
+                "[CrowdSim] Differential wheel joints: "
+                f"left={list(zip(left_ids, left_names))}, "
+                f"right={list(zip(right_ids, right_names))}"
+            )
 
         import types
 
@@ -238,7 +267,7 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
         )
         print(
             f"[CrowdSim] Navigation enabled: {self.config.num_humanoids} humanoid(s), "
-            f"{self.config.num_robots} robot(s), robot_control={self.config.robot_control_mode}."
+            f"{self.config.num_robots} robot(s), car_rl_policy={self.config.car_rl_policy}."
         )
         print(
             "[CrowdSim] Navigation update rate: "
@@ -258,12 +287,13 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
     def pre_step(self) -> None:
         positions, velocities = self._read_agent_state()
         self._compute_sfm_reference_waypoints(positions, velocities)
+        self._update_robot_progress_targets(positions)
         self._update_local_target_markers()
 
         if self.config.num_robots == 0:
             return
 
-        wheel_targets = self._compute_robot_wheel_targets(positions, velocities)
+        wheel_targets = self._compute_robot_wheel_targets()
         self._write_robot_wheel_targets(wheel_targets)
 
     def post_step(self) -> None:
@@ -274,8 +304,6 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
         nav_done_ids = self._navigation_done_agent_ids(new_pairs)
         self._request_humanoid_resets(nav_done_ids)
         self._update_robot_rl_feedback(positions, velocities, new_pairs)
-        if self.config.robot_control_mode.lower() != "rl":
-            self._reset_navigation_robots(nav_done_ids)
         self._last_positions = positions
         self.env.extras["crowdsim_navigation"] = {
             "reached": int(self.reached.sum()),
@@ -446,33 +474,17 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
             np.concatenate([humanoid_vel, robot_vel], axis=0),
         )
 
-    def _compute_robot_wheel_targets(
-        self, positions: np.ndarray, velocities: np.ndarray
-    ) -> np.ndarray:
-        wheel_targets = np.zeros((self.config.num_robots, 2), dtype=np.float32)
-        controller_mode = self.config.robot_control_mode.lower()
-        if controller_mode == "rl":
-            for robot_idx in range(self.config.num_robots):
-                wheel_targets[robot_idx] = self._wheel_controller.action_to_wheels(
-                    self._robot_rl_actions[robot_idx],
-                    self.config.max_speed,
-                )
-            return wheel_targets
-
-        robot_yaws = self._robot_yaws()
-        for robot_idx in range(self.config.num_robots):
-            agent_id = self.config.num_humanoids + robot_idx
-            if self.reached[agent_id]:
-                continue
-            wheel_targets[robot_idx] = self._wheel_controller.waypoint_to_wheels(
-                current_xy=positions[agent_id],
-                current_yaw=float(robot_yaws[robot_idx]),
-                target_xy=self._robot_sfm_waypoints[robot_idx],
-                target_timestep=self.config.local_target_timestep,
-                max_speed=self.config.max_speed,
-            )
-
-        return wheel_targets
+    def _update_robot_progress_targets(self, positions: np.ndarray) -> None:
+        if self.config.num_robots == 0:
+            return
+        robot_positions = positions[
+            self.config.num_humanoids : self.config.num_humanoids + self.config.num_robots
+        ]
+        self._robot_progress_targets[:] = self._robot_sfm_waypoints
+        self._robot_prev_progress_dist[:] = np.linalg.norm(
+            robot_positions - self._robot_progress_targets,
+            axis=1,
+        ).astype(np.float32)
 
     def _compute_sfm_reference_waypoints(
         self, positions: np.ndarray, velocities: np.ndarray
@@ -723,142 +735,6 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
             velocities[agent_id] - velocities[nbrs_idx],
         )
 
-    def _write_robot_wheel_targets(self, wheel_targets: np.ndarray) -> None:
-        if self._wheel_targets_tensor is None:
-            return
-
-        targets_cpu = torch.as_tensor(wheel_targets, dtype=torch.float32)
-        self._wheel_targets_tensor.copy_(targets_cpu, non_blocking=True)
-        targets = self._wheel_targets_tensor
-        if self._left_wheel_joint_ids is not None and self._right_wheel_joint_ids is not None:
-            num_joints = self._num_robot_joints()
-            if (
-                self._joint_velocity_targets is None
-                or self._joint_velocity_targets.shape[1] != num_joints
-            ):
-                self._joint_velocity_targets = torch.zeros(
-                    self.config.num_robots,
-                    num_joints,
-                    dtype=torch.float32,
-                    device=self.config.device,
-                )
-            self._joint_velocity_targets.zero_()
-            left = targets[:, 0:1] * float(self.config.differential_drive.left_wheel_sign)
-            right = targets[:, 1:2] * float(self.config.differential_drive.right_wheel_sign)
-            self._joint_velocity_targets[:, self._left_wheel_joint_ids] = left.expand(
-                -1,
-                int(self._left_wheel_joint_ids.numel()),
-            )
-            self._joint_velocity_targets[:, self._right_wheel_joint_ids] = right.expand(
-                -1,
-                int(self._right_wheel_joint_ids.numel()),
-            )
-            self.robot.set_joint_velocity_target(self._joint_velocity_targets)
-            return
-
-        wheel_joint_indices = self.config.differential_drive.wheel_joint_indices
-        if wheel_joint_indices is not None:
-            joint_ids = torch.as_tensor(
-                wheel_joint_indices,
-                dtype=torch.long,
-                device=self.config.device,
-            )
-            self.robot.set_joint_velocity_target(targets, joint_ids=joint_ids)
-            return
-
-        num_joints = self._num_robot_joints()
-        if num_joints != 2:
-            if (
-                self._joint_velocity_targets is None
-                or self._joint_velocity_targets.shape[1] != num_joints
-            ):
-                self._joint_velocity_targets = torch.zeros(
-                    self.config.num_robots,
-                    num_joints,
-                    dtype=torch.float32,
-                    device=self.config.device,
-                )
-            self._joint_velocity_targets.zero_()
-            self._joint_velocity_targets[:, : min(2, num_joints)].copy_(
-                targets[:, : min(2, num_joints)]
-            )
-            targets = self._joint_velocity_targets
-        self.robot.set_joint_velocity_target(targets)
-
-    def _configure_robot_wheel_joints(self) -> None:
-        joint_names = list(getattr(self.robot.data, "joint_names", []))
-        if not joint_names:
-            print("[CrowdSim] Robot joint names are unavailable; falling back to raw joint order.")
-            return
-
-        print("[CrowdSim] Robot joints:")
-        for idx, name in enumerate(joint_names):
-            print(f"  [{idx}] {name}")
-
-        left_ids = self._find_configured_wheel_joint_ids(
-            joint_names,
-            self.config.differential_drive.left_wheel_joint_names,
-        )
-        right_ids = self._find_configured_wheel_joint_ids(
-            joint_names,
-            self.config.differential_drive.right_wheel_joint_names,
-        )
-        if not left_ids:
-            left_ids = self._find_wheel_joint_ids(joint_names, side="left")
-        if not right_ids:
-            right_ids = self._find_wheel_joint_ids(joint_names, side="right")
-        if not left_ids or not right_ids:
-            print(
-                "[CrowdSim] Warning: failed to auto-detect left/right wheel joints; "
-                "falling back to raw joint order."
-            )
-            return
-
-        self._left_wheel_joint_ids = torch.as_tensor(
-            left_ids,
-            dtype=torch.long,
-            device=self.config.device,
-        )
-        self._right_wheel_joint_ids = torch.as_tensor(
-            right_ids,
-            dtype=torch.long,
-            device=self.config.device,
-        )
-        print(
-            "[CrowdSim] Differential wheel joints: "
-            f"left={[(idx, joint_names[idx]) for idx in left_ids]}, "
-            f"right={[(idx, joint_names[idx]) for idx in right_ids]}, "
-            f"signs=({self.config.differential_drive.left_wheel_sign:g}, "
-            f"{self.config.differential_drive.right_wheel_sign:g})"
-        )
-
-    @staticmethod
-    def _find_configured_wheel_joint_ids(
-        joint_names: list[str],
-        configured_names: tuple[str, ...],
-    ) -> list[int]:
-        wanted = {name.lower() for name in configured_names}
-        return [idx for idx, name in enumerate(joint_names) if name.lower() in wanted]
-
-    @staticmethod
-    def _find_wheel_joint_ids(joint_names: list[str], side: str) -> list[int]:
-        side_tokens = {
-            "left": ("left", "_l_", "_l", "l_", "fl", "rl"),
-            "right": ("right", "_r_", "_r", "r_", "fr", "rr"),
-        }[side]
-        matches: list[int] = []
-        for idx, name in enumerate(joint_names):
-            lowered = name.lower()
-            if "wheel" not in lowered:
-                continue
-            if any(token in lowered for token in side_tokens):
-                matches.append(idx)
-        return matches
-
-    def _num_robot_joints(self) -> int:
-        fallback = self._wheel_targets_tensor.shape[1] if self._wheel_targets_tensor is not None else 2
-        return int(getattr(self.robot, "num_joints", fallback))
-
     def _update_waypoints_and_goals(self, positions: np.ndarray) -> None:
         for agent_id, pos in enumerate(positions):
             path = self.paths_xy[agent_id]
@@ -884,36 +760,6 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
             return
         ids = torch.as_tensor(humanoid_ids, dtype=torch.long, device=self.config.device)
         self.env.reset_buf[ids] = True
-
-    def _reset_navigation_robots(self, agent_ids: np.ndarray) -> None:
-        if self.config.num_robots == 0:
-            return
-        robot_agent_ids = agent_ids[
-            (self.config.num_humanoids <= agent_ids) & (agent_ids < self.num_agents)
-        ]
-        if len(robot_agent_ids) == 0:
-            return
-        robot_ids = robot_agent_ids - self.config.num_humanoids
-        yaw = self._initial_robot_yaws()[robot_ids]
-        env_ids = torch.as_tensor(robot_ids, dtype=torch.long, device=self.config.device)
-        poses = self.robot.data.default_root_state[env_ids, :7].clone()
-        poses[:, 0:2] = torch.as_tensor(
-            self.starts_xy[robot_agent_ids], dtype=torch.float32, device=self.config.device
-        )
-        poses[:, 3:7] = self._yaw_to_quat_tensor(torch.as_tensor(yaw, device=self.config.device))
-        self.robot.write_root_pose_to_sim(poses, env_ids=env_ids)
-        self.robot.write_root_velocity_to_sim(
-            torch.zeros((len(robot_ids), 6), dtype=torch.float32, device=self.config.device),
-            env_ids=env_ids,
-        )
-        self.robot.write_joint_state_to_sim(
-            self.robot.data.default_joint_pos[env_ids].clone(),
-            torch.zeros_like(self.robot.data.default_joint_vel[env_ids]),
-            env_ids=env_ids,
-        )
-        self.robot.reset(env_ids=env_ids)
-        for agent_id in robot_agent_ids:
-            self._replan_agent_from_xy(int(agent_id), self.starts_xy[int(agent_id)])
 
     def _detect_collisions(self, positions: np.ndarray) -> set[tuple[int, int]]:
         new_pairs: set[tuple[int, int]] = set()
@@ -978,6 +824,7 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
         self.collision_pairs = {
             pair for pair in self.collision_pairs if agent_id not in pair
         }
+        self.task.refresh_visualization_markers()
 
     def _current_waypoint(self, agent_id: int) -> np.ndarray:
         path = self.paths_xy[agent_id]

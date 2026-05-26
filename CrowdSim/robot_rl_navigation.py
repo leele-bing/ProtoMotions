@@ -12,7 +12,7 @@ class RobotRLNavigationMixin:
     """Mixin for robot-only PPO observations, rewards, and episode resets."""
 
     def set_robot_rl_actions(self, actions: torch.Tensor | np.ndarray) -> None:
-        if self.config.robot_control_mode.lower() != "rl" or self.config.num_robots == 0:
+        if not self.config.car_rl_policy or self.config.num_robots == 0:
             return
         if isinstance(actions, torch.Tensor):
             values = actions.detach().cpu().numpy()
@@ -24,6 +24,28 @@ class RobotRLNavigationMixin:
                 f"got {values.shape}."
             )
         self._robot_rl_actions[:] = np.clip(values, -1.0, 1.0)
+
+    def _compute_robot_wheel_targets(self) -> np.ndarray:
+        wheel_targets = np.zeros((self.config.num_robots, 2), dtype=np.float32)
+        if not self.config.car_rl_policy:
+            return wheel_targets
+        for robot_idx in range(self.config.num_robots):
+            wheel_targets[robot_idx] = self._wheel_controller.action_to_wheels(
+                self._robot_rl_actions[robot_idx],
+            )
+        return wheel_targets
+
+    def _write_robot_wheel_targets(self, wheel_targets: np.ndarray) -> None:
+        if self._wheel_targets_tensor is None:
+            return
+
+        targets_cpu = torch.as_tensor(wheel_targets, dtype=torch.float32)
+        self._wheel_targets_tensor.copy_(targets_cpu, non_blocking=True)
+        targets = self._wheel_targets_tensor
+        if self._wheel_joint_ids is None:
+            raise RuntimeError("Robot wheel joint targets were not initialized.")
+
+        self.robot.set_joint_velocity_target(targets, joint_ids=self._wheel_joint_ids)
 
     def get_robot_rl_observations(self) -> torch.Tensor:
         positions, velocities = self._read_agent_state()
@@ -55,7 +77,7 @@ class RobotRLNavigationMixin:
         return map_size * map_size
 
     def reset_robot_rl_episodes(self, done: torch.Tensor | np.ndarray) -> None:
-        if self.config.robot_control_mode.lower() != "rl" or self.config.num_robots == 0:
+        if not self.config.car_rl_policy or self.config.num_robots == 0:
             return
         if isinstance(done, torch.Tensor):
             done_np = done.detach().cpu().numpy().astype(bool)
@@ -91,9 +113,8 @@ class RobotRLNavigationMixin:
         for agent_id in agent_ids:
             self._replan_agent_from_xy(int(agent_id), self.starts_xy[int(agent_id)])
         self._robot_episode_steps[robot_ids] = 0
-        self._robot_prev_goal_dist[robot_ids] = np.linalg.norm(
-            self.starts_xy[agent_ids] - self.goals_xy[agent_ids], axis=1
-        )
+        self._robot_progress_targets[robot_ids] = self.starts_xy[agent_ids]
+        self._robot_prev_progress_dist[robot_ids] = 0.0
         agent_id_set = {int(agent_id) for agent_id in agent_ids}
         self.collision_pairs = {
             pair
@@ -107,14 +128,20 @@ class RobotRLNavigationMixin:
         velocities: np.ndarray,
         new_pairs: set[tuple[int, int]],
     ) -> None:
-        if self.config.robot_control_mode.lower() != "rl" or self.config.num_robots == 0:
+        if not self.config.car_rl_policy or self.config.num_robots == 0:
             return
 
         robot_offset = self.config.num_humanoids
         robot_agent_ids = np.arange(robot_offset, robot_offset + self.config.num_robots)
-        current_dist = np.linalg.norm(positions[robot_agent_ids] - self.goals_xy[robot_agent_ids], axis=1)
-        progress = self._robot_prev_goal_dist - current_dist
-        self._robot_prev_goal_dist = current_dist
+        current_goal_dist = np.linalg.norm(
+            positions[robot_agent_ids] - self.goals_xy[robot_agent_ids],
+            axis=1,
+        )
+        current_progress_dist = np.linalg.norm(
+            positions[robot_agent_ids] - self._robot_progress_targets,
+            axis=1,
+        )
+        progress = self._robot_prev_progress_dist - current_progress_dist
         self._robot_episode_steps += 1
 
         collision = np.zeros(self.config.num_robots, dtype=bool)
@@ -149,7 +176,10 @@ class RobotRLNavigationMixin:
             "reached": torch.as_tensor(reached, dtype=torch.bool, device=self.config.device),
             "collision": torch.as_tensor(collision, dtype=torch.bool, device=self.config.device),
             "timeout": torch.as_tensor(timeout, dtype=torch.bool, device=self.config.device),
-            "distance_to_goal": torch.as_tensor(current_dist, dtype=torch.float32, device=self.config.device),
+            "distance_to_goal": torch.as_tensor(current_goal_dist, dtype=torch.float32, device=self.config.device),
+            "distance_to_progress_target": torch.as_tensor(
+                current_progress_dist, dtype=torch.float32, device=self.config.device
+            ),
             "progress": torch.as_tensor(progress, dtype=torch.float32, device=self.config.device),
             "reward_total": torch.as_tensor(rewards, dtype=torch.float32, device=self.config.device),
             "reward_time": torch.as_tensor(time_reward, dtype=torch.float32, device=self.config.device),
@@ -183,8 +213,8 @@ class RobotRLNavigationMixin:
             row = [
                 goal_local[0] / goal_norm,
                 goal_local[1] / goal_norm,
-                vel_local[0] / max(self.config.max_speed, 1e-4),
-                vel_local[1] / max(self.config.max_speed, 1e-4),
+                vel_local[0] / max(self.config.rl_max_linear_velocity, 1e-4),
+                vel_local[1] / max(self.config.rl_max_linear_velocity, 1e-4),
                 math.sin(yaw),
                 math.cos(yaw),
                 goal_dist / goal_norm,
@@ -226,8 +256,8 @@ class RobotRLNavigationMixin:
                 [
                     local_rel[0] / max(self.config.neighbor_radius, 1e-4),
                     local_rel[1] / max(self.config.neighbor_radius, 1e-4),
-                    local_vel[0] / max(self.config.max_speed, 1e-4),
-                    local_vel[1] / max(self.config.max_speed, 1e-4),
+                    local_vel[0] / max(self.config.rl_max_linear_velocity, 1e-4),
+                    local_vel[1] / max(self.config.rl_max_linear_velocity, 1e-4),
                 ]
             )
             used += 1
@@ -257,13 +287,6 @@ class RobotRLNavigationMixin:
                 if 0 <= pixel_y < self.height and 0 <= pixel_x < self.width:
                     patch[row, col] = float(self.obstacle_map[pixel_y, pixel_x] > 0)
         return patch
-
-    def _robot_goal_distances(self, positions: np.ndarray) -> np.ndarray:
-        if self.config.num_robots == 0:
-            return np.zeros(0, dtype=np.float32)
-        start = self.config.num_humanoids
-        end = start + self.config.num_robots
-        return np.linalg.norm(positions[start:end] - self.goals_xy[start:end], axis=1).astype(np.float32)
 
     def _robot_yaws(self) -> np.ndarray:
         if self.config.num_robots == 0:

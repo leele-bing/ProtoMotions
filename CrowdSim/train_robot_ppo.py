@@ -53,11 +53,6 @@ def parse_args() -> argparse.Namespace:
         description="Train a PPO local navigation policy for CrowdSim robots.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--config",
-        default=None,
-        help="Environment config path. Kept as a compatibility alias for --env-config.",
-    )
     parser.add_argument("--env-config", default="CrowdSim/config/env.yaml")
     parser.add_argument("--ppo-config", default="CrowdSim/config/ppo.yaml")
     parser.add_argument("--num-envs", type=int, default=8)
@@ -78,14 +73,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    env_config_path = cfg_path(args.config or args.env_config)
+    env_config_path = cfg_path(args.env_config)
     config = load_config(env_config_path)
     ppo_config_path = cfg_path(args.ppo_config)
     ppo_config = load_config(ppo_config_path) if ppo_config_path.exists() else {}
     merge_ppo_config(config, ppo_config)
     config.setdefault("navigation", {})["enabled"] = True
-    config["navigation"].setdefault("local", {})["method"] = "rl"
-    config["navigation"]["local"]["method"] = "rl"
+    config.setdefault("car", {})["rl_policy"] = True
     training_cfg = get_config_section(ppo_config, "training")
     network_cfg = get_config_section(ppo_config, "network")
 
@@ -321,6 +315,12 @@ def train_loop(
         collision = info.get("collision", torch.zeros_like(robot_done)).float().mean().item()
         timeout = info.get("timeout", torch.zeros_like(robot_done)).float().mean().item()
         goal_distance = info.get("distance_to_goal", torch.zeros_like(robot_reward)).float().mean().item()
+        progress_target_distance = (
+            info.get("distance_to_progress_target", torch.zeros_like(robot_reward))
+            .float()
+            .mean()
+            .item()
+        )
         progress = info.get("progress", torch.zeros_like(robot_reward)).float().mean().item()
         reward_total = info.get("reward_total", robot_reward).float().mean().item()
         reward_progress = info.get("reward_progress", torch.zeros_like(robot_reward)).float().mean().item()
@@ -332,7 +332,8 @@ def train_loop(
             f"[CrowdSim][PPO] robot_steps={robot_steps} "
             f"return={mean_return:.3f} len={mean_length:.1f} "
             f"reached={reached:.2f} collision={collision:.2f} timeout={timeout:.2f} "
-            f"goal_distance={goal_distance:.3f} progress={progress:.3f} "
+            f"goal_distance={goal_distance:.3f} sfm_target_distance={progress_target_distance:.3f} "
+            f"progress={progress:.3f} "
             f"reward={reward_total:.3f} progress_reward={reward_progress:.3f} "
             f"policy_loss={stats['policy_loss']:.4f} "
             f"value_loss={stats['value_loss']:.4f} entropy={stats['entropy']:.4f}"
@@ -345,6 +346,7 @@ def train_loop(
             collision=collision,
             timeout=timeout,
             goal_distance=goal_distance,
+            progress_target_distance=progress_target_distance,
             progress=progress,
             reward_total=reward_total,
             reward_progress=reward_progress,
@@ -380,43 +382,27 @@ class RobotTrainingLogger:
 
     def log(self, step: int, **metrics: float) -> None:
         if self.tb is not None:
-            self.tb.add_scalars(
-                "loss_entropy",
-                {
-                    "policy_loss": metrics["policy_loss"],
-                    "value_loss": metrics["value_loss"],
-                    "entropy": metrics["entropy"],
-                },
+            self.tb.add_scalar("loss/policy_loss", metrics["policy_loss"], step)
+            self.tb.add_scalar("loss/value_loss", metrics["value_loss"], step)
+            self.tb.add_scalar("loss/entropy", metrics["entropy"], step)
+
+            self.tb.add_scalar("reward/total", metrics["reward_total"], step)
+            self.tb.add_scalar("reward/progress", metrics["reward_progress"], step)
+            self.tb.add_scalar("reward/terminal", metrics["reward_terminal"], step)
+
+            self.tb.add_scalar("outcome/reached", metrics["reached"], step)
+            self.tb.add_scalar("outcome/collision", metrics["collision"], step)
+            self.tb.add_scalar("outcome/timeout", metrics["timeout"], step)
+
+            self.tb.add_scalar("mean/return", metrics["mean_return"], step)
+            self.tb.add_scalar("mean/length", metrics["mean_length"], step)
+            self.tb.add_scalar("mean/goal_distance", metrics["goal_distance"], step)
+            self.tb.add_scalar(
+                "mean/progress_target_distance",
+                metrics["progress_target_distance"],
                 step,
             )
-            self.tb.add_scalars(
-                "reward",
-                {
-                    "total": metrics["reward_total"],
-                    "progress": metrics["reward_progress"],
-                    "terminal": metrics["reward_terminal"],
-                },
-                step,
-            )
-            self.tb.add_scalars(
-                "outcome",
-                {
-                    "reached": metrics["reached"],
-                    "collision": metrics["collision"],
-                    "timeout": metrics["timeout"],
-                },
-                step,
-            )
-            self.tb.add_scalars(
-                "mean",
-                {
-                    "return": metrics["mean_return"],
-                    "length": metrics["mean_length"],
-                    "goal_distance": metrics["goal_distance"],
-                    "progress": metrics["progress"],
-                },
-                step,
-            )
+            self.tb.add_scalar("mean/progress", metrics["progress"], step)
 
     def close(self) -> None:
         if self.tb is not None:
@@ -538,6 +524,7 @@ def build_navigation_manager(
     humanoid_cfg = cfg.get("humanoid", {})
     marker_cfg = get_marker_config(cfg)
     rl_cfg = get_robot_rl_config(cfg)
+    reward_cfg = get_reward_config(rl_cfg)
     return CrowdNavigationManager(
         CrowdNavigationConfig(
             map_path=map_metadata.image_path,
@@ -548,7 +535,6 @@ def build_navigation_manager(
             num_robots=num_robots,
             device=device,
             seed=int(path_cfg.get("seed", 7)),
-            robot_control_mode=str(local_cfg.get("method", "rl")),
             agent_radius=float(local_cfg.get("agent_radius", 0.35)),
             safe_distance=float(local_cfg.get("safe_distance", 0.75)),
             max_speed=float(local_cfg.get("max_speed", 1.5)),
@@ -573,14 +559,17 @@ def build_navigation_manager(
             humanoid_target_min_heading_speed=float(
                 humanoid_cfg.get("min_heading_speed", 0.05)
             ),
-            differential_drive=DifferentialDriveConfig(),
+            differential_drive=make_differential_drive_config(rl_cfg),
+            car_rl_policy=True,
             rl_num_neighbors=int(rl_cfg.get("num_neighbors", 4)),
-            rl_progress_reward_scale=float(rl_cfg.get("progress_reward_scale", 4.0)),
-            rl_goal_reward=float(rl_cfg.get("goal_reward", 10.0)),
-            rl_collision_penalty=float(rl_cfg.get("collision_penalty", -10.0)),
-            rl_timeout_penalty=float(rl_cfg.get("timeout_penalty", -5.0)),
-            rl_time_penalty=float(rl_cfg.get("time_penalty", -0.01)),
-            rl_max_episode_steps=int(rl_cfg.get("max_episode_steps", 600)),
+            rl_max_linear_velocity=float(rl_cfg.get("max_linear_velocity", 2.0)),
+            rl_max_angular_velocity=float(rl_cfg.get("max_angular_velocity", 2.0)),
+            rl_progress_reward_scale=float(reward_cfg.get("progress_reward_scale", 4.0)),
+            rl_goal_reward=float(reward_cfg.get("goal_reward", 10.0)),
+            rl_collision_penalty=float(reward_cfg.get("collision_penalty", -10.0)),
+            rl_timeout_penalty=float(reward_cfg.get("timeout_penalty", -5.0)),
+            rl_time_penalty=float(reward_cfg.get("time_penalty", -0.01)),
+            rl_max_episode_steps=int(reward_cfg.get("max_episode_steps", 600)),
             rl_map_size=int(rl_cfg.get("map_size", 24)),
             rl_map_extent=float(rl_cfg.get("map_extent", 8.0)),
         )
@@ -598,6 +587,25 @@ def get_robot_rl_config(cfg: dict[str, Any]) -> dict[str, Any]:
     nav_cfg = cfg.get("navigation", {})
     rl_cfg = nav_cfg.get("rl", cfg.get("rl", {}))
     return rl_cfg if isinstance(rl_cfg, dict) else {}
+
+
+def get_reward_config(rl_cfg: dict[str, Any]) -> dict[str, Any]:
+    reward_cfg = rl_cfg.get("reward", {})
+    return reward_cfg if isinstance(reward_cfg, dict) else {}
+
+
+def make_differential_drive_config(rl_cfg: dict[str, Any]) -> DifferentialDriveConfig:
+    defaults = DifferentialDriveConfig()
+    max_linear_speed = float(rl_cfg.get("max_linear_velocity", defaults.max_linear_speed))
+    max_angular_speed = float(rl_cfg.get("max_angular_velocity", defaults.max_angular_speed))
+    max_wheel_speed = (
+        max_linear_speed + 0.5 * defaults.wheel_base * max_angular_speed
+    ) / defaults.wheel_radius
+    return DifferentialDriveConfig(
+        max_linear_speed=max_linear_speed,
+        max_angular_speed=max_angular_speed,
+        max_wheel_speed=max_wheel_speed,
+    )
 
 
 def get_marker_config(cfg: dict[str, Any]) -> dict[str, Any]:

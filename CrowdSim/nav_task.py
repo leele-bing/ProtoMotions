@@ -49,6 +49,7 @@ class NavigationTask:
         self.component_labels, self.component_sizes = self._label_planner_free_space()
         self._component_pixel_cache: dict[int, np.ndarray] = {}
         self._markers: NavigationTaskMarkers | None = None
+        self._marker_num_humanoids = 0
         self.starts_px, self.goals_px, self.paths_xy = self._sample_start_goal_paths()
         self.starts_xy = np.asarray(
             [self.pixel_to_world(px) for px in self.starts_px], dtype=np.float32
@@ -243,8 +244,14 @@ class NavigationTask:
         return self._component_pixel_cache[component_id]
 
     def create_visualization_markers(self, num_humanoids: int, enabled: bool) -> None:
+        self._marker_num_humanoids = int(num_humanoids)
         self._markers = NavigationTaskMarkers(enabled)
         self._markers.create(self, num_humanoids)
+
+    def refresh_visualization_markers(self) -> None:
+        if self._markers is None:
+            return
+        self._markers.update(self, self._marker_num_humanoids)
 
 
 def agent_marker_color(agent_id: int) -> tuple[float, float, float]:
@@ -296,6 +303,12 @@ class NavigationTaskMarkers:
                 ),
             )
         )
+
+        self.update(task, num_humanoids)
+
+    def update(self, task: NavigationTask, num_humanoids: int) -> None:
+        if not self.enabled or self.agent_marker is None:
+            return
 
         translations, orientations, scales, marker_indices = self._static_marker_arrays(
             paths_xy=task.paths_xy,

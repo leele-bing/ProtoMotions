@@ -57,6 +57,10 @@ scene:
 常用导航配置：
 
 ```yaml
+car:
+  rl_policy: true
+  policy_checkpoint: output/crowdsim_robot_ppo/latest/robot_ppo_latest.pt
+
 navigation:
   enabled: true
   path:
@@ -167,9 +171,9 @@ python CrowdSim/tools/filter_scene_usd.py \
 
 1. 根据当前位置推进当前 A* waypoint。
 2. SFM 根据当前位置、速度、邻居和路径方向计算 1 秒后的 local target。
-3. car 在 `local.method: sfm` 时，差速控制器追踪这个 local target。
-4. car 在 `local.method: rl` 时，PPO 策略接收 SFM local target 作为参考，但不直接使用 SFM 速度控制。
-5. humanoid 使用 MaskedMimic，导航模块把 SFM local target 和 A* path 采样点转换成 pelvis future targets。
+3. humanoid 使用 MaskedMimic，导航模块把 SFM local target 和 A* path 采样点转换成 pelvis future targets。
+4. car 在 `car.rl_policy: true` 时由 PPO 直接根据全局目标等 RL observation 输出线速度/角速度。
+5. SFM 仍会为 car 计算 local target 并写入日志，但不会向 car 下发速度控制；`car.rl_policy: false` 时小车保持静止。
 6. 如果 reach、collision 或 timeout，agent reset 后重新采样目标并重新规划路径。
 
 ## Humanoid Env 与 Navigation Env 的关系
@@ -205,8 +209,8 @@ agent_id = num_humanoids ... num_humanoids + num_robots - 1
 3. `navigation.attach(env)` 会 hook `env.reset()` 和 `env.step()`。
 4. 每次 `env.step(humanoid_action)` 前后，navigation manager 会按 `navigation.update_hz` 更新 waypoint、SFM local target、collision 和轨迹日志。
 5. humanoid action 始终来自 MaskedMimic policy；navigation 只修改 MaskedMimic 的 pelvis future target，不直接给 humanoid 下发速度。
-6. car 在 `local.method: sfm` 时由 SFM local target 经过差速控制器控制。
-7. car 在 `local.method: rl` 时由 PPO 输出归一化线速度/角速度指令，再经过差速公式转成轮速。SFM 仍然计算 local target，但只作为观测和奖励参考。
+6. car 在 `car.rl_policy: true` 时由 PPO 输出归一化线速度/角速度指令，再经过差速公式转成轮速。
+7. SFM 仍然为 humanoid 和日志计算 local target，但不会作为 car RL observation 输入。
 
 reset 也分成两条链路：
 
@@ -244,7 +248,7 @@ motion file 主要提供：
 
 ## 小车差速控制
 
-`differential_control.py` 负责把局部目标转换成差速轮速度。
+`differential_control.py` 负责把 RL 输出的归一化线速度、角速度转换成差速轮速度。
 
 当前差速控制使用固定机器人参数，例如 Nova Carter：
 
@@ -253,9 +257,9 @@ motion file 主要提供：
 - Wheel Distance: `0.413 m`
 - Wheel Radius: `0.14 m`
 
-SFM 输出的是平面 local target，而不是满足差速约束的控制量。差速控制器会根据小车当前朝向和 local target 计算线速度、角速度，再用差速公式转换为左右轮速度。
+小车的 RL action 是归一化的 `[linear_velocity, angular_velocity]`。差速控制器先把它映射到真实速度范围，再用差速公式转换为左右轮速度。
 
-`nova_carter` 的 wheel joint 名称和左右轮符号固定在 `differential_control.py` 中，其中 `right_wheel_sign: -1.0` 用于补偿左右轮 joint axis 方向相反的问题。
+`nova_carter` 的 wheel joint 名称固定在 `differential_control.py` 中。当前 CrowdSim 通过 IsaacLab `Articulation.set_joint_velocity_target()` 下发轮速；在这条路径下，直行对应左右 wheel joint 同号。
 
 ## 小车 PPO 训练
 
@@ -286,10 +290,12 @@ python CrowdSim/train_robot_ppo.py \
 navigation:
   enabled: true
   local:
-    method: rl
+    method: sfm
+car:
+  rl_policy: true
 ```
 
-也就是说，训练时 car 的动作来自 PPO；SFM 仍然计算 local target，但它只作为参考目标和奖励信号，不直接下发给差速控制器。
+也就是说，训练时 car 的动作来自 PPO；SFM 仍然为 humanoid 和日志计算 local target，但不作为 car RL observation 输入，也不直接下发给小车。
 
 ### RL Observation
 
@@ -297,10 +303,11 @@ navigation:
 
 当前 vector observation 包含：
 
-- SFM local target，机器人坐标系下 2 维。
 - global goal，机器人坐标系下 2 维。
 - 当前小车平面速度，机器人坐标系下 2 维。
 - 当前 yaw 的 `sin(yaw)` 和 `cos(yaw)`。
+- 到 global goal 的距离。
+- 当前 robot episode 进度。
 - 最近的 `num_neighbors` 个邻居 agent 状态。
 
 邻居 agent 不区分 humanoid 和 car。每个邻居使用 4 维：
@@ -355,7 +362,7 @@ total_obs_dim = 600
 PPO reward 当前由以下部分组成：
 
 - `time_penalty`：每步时间惩罚。
-- `progress_reward_scale * progress`：靠近 global goal 的进度奖励。
+- `progress_reward_scale * progress`：靠近 action 前缓存的 SFM local target 的进度奖励，用作 path tracking dense reward。
 - `goal_reward`：到达终点奖励。
 - `collision_penalty`：碰撞惩罚。
 - `timeout_penalty`：episode 超时惩罚。
@@ -393,12 +400,12 @@ output/crowdsim_robot_ppo/YYYYmmdd_HHMMSS/
 
 `output/crowdsim_robot_ppo/latest` 会指向最近一次训练 run。
 
-TensorBoard 当前按四组曲线记录：
+TensorBoard 当前按四组 tag 前缀组织，每个指标单独成图：
 
-- `loss_entropy`：`policy_loss`、`value_loss`、`entropy`。
-- `reward`：`total`、`progress`、`terminal`。
-- `outcome`：`reached`、`collision`、`timeout`。
-- `mean`：`return`、`length`、`goal_distance`、`progress`。
+- `loss/*`：`policy_loss`、`value_loss`、`entropy`。
+- `reward/*`：`total`、`progress`、`terminal`。
+- `outcome/*`：`reached`、`collision`、`timeout`。
+- `mean/*`：`return`、`length`、`goal_distance`、`progress_target_distance`、`progress`。
 
 其中 `terminal = reward_goal + reward_collision + reward_timeout`。`reached` / `collision` / `timeout` 已经表达了终止事件比例，所以不再把对应的 reward 分量单独画成三张图；`reward_time` 是每步常数，也不单独记录。
 
@@ -423,15 +430,8 @@ python CrowdSim/train_robot_ppo.py \
 在 `env.yaml` 中设置：
 
 ```yaml
-navigation:
-  local:
-    method: rl
-```
-
-在 `ppo.yaml` 中设置：
-
-```yaml
-rl:
+car:
+  rl_policy: true
   policy_checkpoint: output/crowdsim_robot_ppo/latest/robot_ppo_latest.pt
 ```
 
@@ -563,7 +563,7 @@ viewer 中按 `H` 开始或停止录制。
 - 如果两张 GPU 都有显存占用，通常是 Isaac Sim、渲染、torch 或 CUDA context 初始化导致，不一定表示 PPO 或 humanoid 策略在多卡训练。
 - `motion_file` 不是可选的导航路径文件，而是 MaskedMimic 的动作库。
 - `navigation.enabled: false` 时不会走 CrowdSim 的路径规划和导航 reset 逻辑。
-- `local.method: rl` 需要 `ppo.yaml -> rl.policy_checkpoint`，除非运行的是 `train_robot_ppo.py`。
+- `car.rl_policy: true` 需要 `env.yaml -> car.policy_checkpoint`，除非运行的是 `train_robot_ppo.py`。
 - 修改 PPO observation 结构后，旧 checkpoint 大概率不能加载。
 - 场景 USD 的坐标系和 occupancy map 的 `origin/resolution` 必须匹配，否则采样点、路径和实体位置会错位。
 - 当前 collision 是基于平面距离的简化检测，不是完整 mesh 碰撞检测。

@@ -54,11 +54,7 @@ def parse_args() -> argparse.Namespace:
         description="Run CrowdSim from a YAML config.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--config",
-        default=None,
-        help="Environment config path. Kept as a compatibility alias for --env-config.",
-    )
+
     parser.add_argument("--env-config", default="CrowdSim/config/env.yaml")
     parser.add_argument("--ppo-config", default="CrowdSim/config/ppo.yaml")
     parser.add_argument("--num-envs", type=int, default=4)
@@ -153,7 +149,7 @@ def cfg_path(path_like: str) -> Path:
 
 def main() -> None:
     args = parse_args()
-    config = load_config(cfg_path(args.config or args.env_config))
+    config = load_config(cfg_path(args.env_config))
     ppo_config_path = cfg_path(args.ppo_config)
     if ppo_config_path.exists():
         merge_ppo_config(config, load_config(ppo_config_path))
@@ -264,7 +260,7 @@ def main() -> None:
     if args.full_eval:
         runtime.agent.evaluator.eval_count = 0
         print(runtime.agent.evaluator.evaluate())
-    elif nav_manager is not None and nav_manager.config.robot_control_mode.lower() == "rl":
+    elif nav_manager is not None and nav_manager.config.car_rl_policy:
         run_masked_mimic_with_robot_ppo(runtime, nav_manager, config)
     else:
         run_masked_mimic_policy_loop(runtime)
@@ -390,8 +386,10 @@ def build_navigation_manager(
     local_cfg = nav_cfg.get("local", {})
     recording_cfg = nav_cfg.get("recording", {})
     humanoid_cfg = cfg.get("humanoid", {})
+    car_cfg = cfg.get("car", {})
     marker_cfg = get_marker_config(cfg)
     rl_cfg = get_robot_rl_config(cfg)
+    reward_cfg = get_reward_config(rl_cfg)
     config = CrowdNavigationConfig(
         map_path=map_metadata.image_path,
         map_resolution=map_metadata.resolution,
@@ -401,7 +399,6 @@ def build_navigation_manager(
         num_robots=num_robots,
         device=device,
         seed=int(path_cfg.get("seed", 7)),
-        robot_control_mode=str(local_cfg.get("method", "sfm")),
         agent_radius=float(local_cfg.get("agent_radius", 0.35)),
         safe_distance=float(local_cfg.get("safe_distance", 0.75)),
         max_speed=float(local_cfg.get("max_speed", 1.5)),
@@ -426,14 +423,17 @@ def build_navigation_manager(
         humanoid_target_min_heading_speed=float(
             humanoid_cfg.get("min_heading_speed", 0.05)
         ),
-        differential_drive=DifferentialDriveConfig(),
+        differential_drive=make_differential_drive_config(rl_cfg),
+        car_rl_policy=bool(car_cfg.get("rl_policy", True)),
         rl_num_neighbors=int(rl_cfg.get("num_neighbors", 4)),
-        rl_progress_reward_scale=float(rl_cfg.get("progress_reward_scale", 4.0)),
-        rl_goal_reward=float(rl_cfg.get("goal_reward", 10.0)),
-        rl_collision_penalty=float(rl_cfg.get("collision_penalty", -10.0)),
-        rl_timeout_penalty=float(rl_cfg.get("timeout_penalty", -5.0)),
-        rl_time_penalty=float(rl_cfg.get("time_penalty", -0.01)),
-        rl_max_episode_steps=int(rl_cfg.get("max_episode_steps", 600)),
+        rl_max_linear_velocity=float(rl_cfg.get("max_linear_velocity", 2.0)),
+        rl_max_angular_velocity=float(rl_cfg.get("max_angular_velocity", 2.0)),
+        rl_progress_reward_scale=float(reward_cfg.get("progress_reward_scale", 4.0)),
+        rl_goal_reward=float(reward_cfg.get("goal_reward", 10.0)),
+        rl_collision_penalty=float(reward_cfg.get("collision_penalty", -10.0)),
+        rl_timeout_penalty=float(reward_cfg.get("timeout_penalty", -5.0)),
+        rl_time_penalty=float(reward_cfg.get("time_penalty", -0.01)),
+        rl_max_episode_steps=int(reward_cfg.get("max_episode_steps", 600)),
         rl_map_size=int(rl_cfg.get("map_size", 24)),
         rl_map_extent=float(rl_cfg.get("map_extent", 8.0)),
     )
@@ -446,10 +446,11 @@ def run_masked_mimic_with_robot_ppo(
     cfg: dict[str, Any],
 ) -> None:
     rl_cfg = get_robot_rl_config(cfg)
-    checkpoint = rl_cfg.get("policy_checkpoint")
+    car_cfg = cfg.get("car", {})
+    checkpoint = car_cfg.get("policy_checkpoint")
     if checkpoint is None:
         raise RuntimeError(
-            "navigation.local.method is 'rl', but rl.policy_checkpoint is not set in the PPO config. "
+            "car.rl_policy is true, but car.policy_checkpoint is not set in the environment config. "
             "Train a policy with CrowdSim/train_robot_ppo.py first, then point this field at the checkpoint."
         )
 
@@ -460,7 +461,7 @@ def run_masked_mimic_with_robot_ppo(
             obs_dim=nav_manager.robot_rl_obs_dim,
             vector_obs_dim=nav_manager.robot_rl_vector_obs_dim,
             map_size=nav_manager.config.rl_map_size,
-            hidden_dim=int(rl_cfg.get("hidden_dim", 128)),
+            hidden_dim=int(get_network_config(cfg).get("hidden_dim", 128)),
         ),
         nav_manager.config.device,
     )
@@ -504,12 +505,39 @@ def merge_ppo_config(env_cfg: dict[str, Any], ppo_cfg: dict[str, Any]) -> None:
     if not isinstance(rl_cfg, dict):
         return
     env_cfg.setdefault("navigation", {})["rl"] = rl_cfg
+    network_cfg = ppo_cfg.get("network", {})
+    if isinstance(network_cfg, dict):
+        env_cfg["network"] = network_cfg
 
 
 def get_robot_rl_config(cfg: dict[str, Any]) -> dict[str, Any]:
     nav_cfg = cfg.get("navigation", {})
     rl_cfg = nav_cfg.get("rl", cfg.get("rl", {}))
     return rl_cfg if isinstance(rl_cfg, dict) else {}
+
+
+def get_reward_config(rl_cfg: dict[str, Any]) -> dict[str, Any]:
+    reward_cfg = rl_cfg.get("reward", {})
+    return reward_cfg if isinstance(reward_cfg, dict) else {}
+
+
+def get_network_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    network_cfg = cfg.get("network", {})
+    return network_cfg if isinstance(network_cfg, dict) else {}
+
+
+def make_differential_drive_config(rl_cfg: dict[str, Any]) -> DifferentialDriveConfig:
+    defaults = DifferentialDriveConfig()
+    max_linear_speed = float(rl_cfg.get("max_linear_velocity", defaults.max_linear_speed))
+    max_angular_speed = float(rl_cfg.get("max_angular_velocity", defaults.max_angular_speed))
+    max_wheel_speed = (
+        max_linear_speed + 0.5 * defaults.wheel_base * max_angular_speed
+    ) / defaults.wheel_radius
+    return DifferentialDriveConfig(
+        max_linear_speed=max_linear_speed,
+        max_angular_speed=max_angular_speed,
+        max_wheel_speed=max_wheel_speed,
+    )
 
 
 def get_marker_config(cfg: dict[str, Any]) -> dict[str, Any]:

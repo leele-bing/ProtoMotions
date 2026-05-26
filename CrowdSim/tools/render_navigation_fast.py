@@ -83,7 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--stride", type=int, default=1, help="Use every Nth recorded frame.")
     parser.add_argument("--max-frames", type=int, default=0, help="0 means use all frames.")
-    parser.add_argument("--trail-length", type=int, default=80)
+    parser.add_argument("--trail-length", type=int, default=200)
     parser.add_argument(
         "--crop-center-pixels",
         type=int,
