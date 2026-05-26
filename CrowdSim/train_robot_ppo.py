@@ -87,8 +87,6 @@ def main() -> None:
     humanoid_cfg = config.get("humanoid", {})
     car_cfg = config.get("car", {})
     sensor_cfg = config.get("sensors", {})
-    if args.headless and isinstance(sensor_cfg.get("camera"), dict):
-        sensor_cfg["camera"]["enabled"] = False
 
     checkpoint = resolve_repo_path(humanoid_cfg["checkpoint"])
     motion_file = resolve_repo_path(humanoid_cfg["motion_file"])
