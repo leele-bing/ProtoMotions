@@ -50,6 +50,9 @@ class RobotCameraRecorder:
         self.frame_idx = 0
         self.sim_time = 0.0
         self.next_capture_time = 0.0
+        for env_id in self.env_ids:
+            env_dir = self._env_dir(env_id)
+            env_dir.mkdir(parents=True, exist_ok=True)
         self._write_metadata()
         print(
             f"[CrowdSim] Robot camera recording started at {self.fps:g} fps: "
@@ -63,9 +66,20 @@ class RobotCameraRecorder:
         if self.sim_time + 1e-9 < self.next_capture_time:
             return
 
+        self._render_for_camera()
         self._save_frame()
         self.frame_idx += 1
         self.next_capture_time += 1.0 / self.fps
+
+    def _render_for_camera(self) -> None:
+        simulator = getattr(self.env, "simulator", None)
+        if simulator is None or not getattr(simulator, "headless", False):
+            return
+
+        sim_context = getattr(simulator, "_sim", None)
+        if sim_context is None:
+            return
+        sim_context.render()
 
     def _write_metadata(self) -> None:
         camera = self.env.crowdsim_robot_camera
@@ -73,6 +87,7 @@ class RobotCameraRecorder:
             {
                 "fps": self.fps,
                 "env_ids": self.env_ids,
+                "layout": "per_env",
                 "image_shape": camera.data.image_shape,
                 "intrinsic_matrices": None
                 if camera.data.intrinsic_matrices is None
@@ -80,6 +95,11 @@ class RobotCameraRecorder:
             },
             self.session_dir / "metadata.pt",
         )
+
+    def _env_dir(self, env_id: int) -> Path:
+        if self.session_dir is None:
+            raise RuntimeError("Camera recording session has not been started.")
+        return self.session_dir / f"env_{env_id:04d}"
 
     def _save_frame(self) -> None:
         from PIL import Image
@@ -92,15 +112,14 @@ class RobotCameraRecorder:
 
         rgb = output["rgb"].detach().cpu()
         depth = output["distance_to_image_plane"].detach().cpu()
-        frame_dir = self.session_dir / f"frame_{self.frame_idx:06d}"
-        frame_dir.mkdir(parents=True, exist_ok=True)
 
         for env_id in self.env_ids:
+            env_dir = self._env_dir(env_id)
             rgb_np = rgb[env_id].numpy()
             if rgb_np.dtype != "uint8":
                 rgb_np = rgb_np.clip(0, 255).astype("uint8")
-            Image.fromarray(rgb_np[..., :3]).save(frame_dir / f"env_{env_id:04d}_rgb.png")
-            torch.save(depth[env_id], frame_dir / f"env_{env_id:04d}_depth.pt")
+            Image.fromarray(rgb_np[..., :3]).save(env_dir / f"rgb_{self.frame_idx:06d}.png")
+            torch.save(depth[env_id], env_dir / f"depth_{self.frame_idx:06d}.pt")
 
 
 def configure_robot_camera_recorder(
