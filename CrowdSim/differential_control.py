@@ -16,6 +16,10 @@ MAX_WHEEL_SPEED = (
     MAX_LINEAR_SPEED + 0.5 * WHEEL_BASE * MAX_ANGULAR_SPEED
 ) / WHEEL_RADIUS
 WHEEL_JOINT_INDICES: tuple[int, int] | None = None
+LEFT_WHEEL_JOINT_NAMES = ("joint_wheel_left",)
+RIGHT_WHEEL_JOINT_NAMES = ("joint_wheel_right",)
+LEFT_WHEEL_SIGN = 1.0
+RIGHT_WHEEL_SIGN = -1.0
 
 
 @dataclass(frozen=True)
@@ -26,6 +30,10 @@ class DifferentialDriveConfig:
     wheel_base: float = WHEEL_BASE
     max_wheel_speed: float = MAX_WHEEL_SPEED
     wheel_joint_indices: tuple[int, int] | None = WHEEL_JOINT_INDICES
+    left_wheel_joint_names: tuple[str, ...] = LEFT_WHEEL_JOINT_NAMES
+    right_wheel_joint_names: tuple[str, ...] = RIGHT_WHEEL_JOINT_NAMES
+    left_wheel_sign: float = LEFT_WHEEL_SIGN
+    right_wheel_sign: float = RIGHT_WHEEL_SIGN
 
 
 class ManualDifferentialController:

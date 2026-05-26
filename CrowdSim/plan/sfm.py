@@ -11,11 +11,11 @@ class Social_Force:
         self.rad = cfg['agent']['radius']
         self.max_speed = cfg['agent']['max_vel']      
 
-        self.gain_k = 3
-        self.gain_a_static = 4
+        self.gain_k = 5
+        self.gain_a_static = 15
         self.gain_b_static = 0.25
 
-        self.gain_a_agent = 7
+        self.gain_a_agent = 25
         self.gain_b_agent = 0.5
         
         self.distance_field = edt

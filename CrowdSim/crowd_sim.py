@@ -23,6 +23,7 @@ from CrowdSim.utils.humanoid_state_recorder import (  # noqa: E402
 )
 from CrowdSim.utils.map_metadata import OccupancyMapMetadata, load_occupancy_map_metadata  # noqa: E402
 from CrowdSim.navigation import CrowdNavigationConfig, CrowdNavigationManager  # noqa: E402
+from CrowdSim.differential_control import DifferentialDriveConfig  # noqa: E402
 from CrowdSim.utils.sensor_stream import (  # noqa: E402
     RobotCameraStreamConfig,
     configure_robot_camera_recorder,
@@ -160,6 +161,8 @@ def main() -> None:
     humanoid_cfg = config.get("humanoid", {})
     car_cfg = config.get("car", {})
     sensor_cfg = config.get("sensors", {})
+    if args.headless and isinstance(sensor_cfg.get("camera"), dict):
+        sensor_cfg["camera"]["enabled"] = False
 
     checkpoint = resolve_repo_path(humanoid_cfg["checkpoint"])
     motion_file = resolve_repo_path(humanoid_cfg["motion_file"])
@@ -242,15 +245,16 @@ def main() -> None:
                 map_metadata, env.num_envs, fabric.device, config
             )
         apply_fixed_crowd_robot_spawns(env, robot_spawn_xy_yaw)
-        configure_robot_camera_recorder(
-            env,
-            RobotCameraStreamConfig(
-                output_dir=resolve_repo_path(sensor_cfg.get("camera", {}).get("record_dir", "output/crowdsim_camera")),
-                fps=float(sensor_cfg.get("camera", {}).get("record_fps", 10.0)),
-                env_ids=str(sensor_cfg.get("camera", {}).get("record_envs", "0")),
-                auto_record=bool(sensor_cfg.get("camera", {}).get("auto_record", False)),
-            ),
-        )
+        if sensor_cfg.get("camera", {}).get("enabled", False):
+            configure_robot_camera_recorder(
+                env,
+                RobotCameraStreamConfig(
+                    output_dir=resolve_repo_path(sensor_cfg.get("camera", {}).get("record_dir", "output/crowdsim_camera")),
+                    fps=float(sensor_cfg.get("camera", {}).get("record_fps", 10.0)),
+                    env_ids=str(sensor_cfg.get("camera", {}).get("record_envs", "0")),
+                    auto_record=bool(sensor_cfg.get("camera", {}).get("auto_record", False)),
+                ),
+            )
         print(f"[CrowdSim] Navigation robots ready: {env.num_envs}.")
 
     if nav_manager is not None:
@@ -263,7 +267,7 @@ def main() -> None:
     elif nav_manager is not None and nav_manager.config.robot_control_mode.lower() == "rl":
         run_masked_mimic_with_robot_ppo(runtime, nav_manager, config)
     else:
-        runtime.agent.evaluator.simple_test_policy(collect_metrics=True)
+        run_masked_mimic_policy_loop(runtime)
 
 
 def validate_paths(paths: dict[str, Path]) -> None:
@@ -289,6 +293,28 @@ def configure_humanoid_state_recording(env, cfg: dict[str, Any]):
             key=str(record_cfg.get("key", "H")),
         ),
     )
+
+
+def run_masked_mimic_policy_loop(runtime) -> None:
+    agent = runtime.agent
+    env = runtime.env
+    agent.eval()
+    done_indices = None
+    step = 0
+    print("[CrowdSim] Running MaskedMimic inference loop... (Ctrl+C to stop)")
+    try:
+        while True:
+            obs, _ = env.reset(done_indices)
+            obs = agent.add_agent_info_to_obs(obs)
+            obs_td = agent.obs_dict_to_tensordict(obs)
+            with torch.no_grad():
+                model_outs = agent.model(obs_td)
+                action = model_outs.get("mean_action", model_outs["action"])
+            _, _, dones, _, _ = env.step(action)
+            done_indices = dones.nonzero(as_tuple=False).squeeze(-1)
+            step += 1
+    except KeyboardInterrupt:
+        print(f"\nStopped after {step} steps.")
 
 
 def sample_or_parse_humanoid_spawns(
@@ -382,6 +408,7 @@ def build_navigation_manager(
         waypoint_tolerance=float(nav_cfg.get("waypoint_tolerance", 0.45)),
         goal_tolerance=float(nav_cfg.get("goal_tolerance", 0.75)),
         min_start_goal_distance=float(path_cfg.get("min_start_goal_distance", 5.0)),
+        max_start_goal_distance=float(path_cfg.get("max_start_goal_distance", 10.0)),
         min_spawn_spacing=float(path_cfg.get("min_spawn_spacing", 1.2)),
         planning_step_size=float(path_cfg.get("planning_step_size", 0.5)),
         planning_clearance=float(path_cfg.get("planning_clearance", 0.2)),
@@ -399,14 +426,16 @@ def build_navigation_manager(
         humanoid_target_min_heading_speed=float(
             humanoid_cfg.get("min_heading_speed", 0.05)
         ),
+        differential_drive=DifferentialDriveConfig(),
         rl_num_neighbors=int(rl_cfg.get("num_neighbors", 4)),
-        rl_num_obstacles=int(rl_cfg.get("num_obstacles", 8)),
-        rl_obstacle_radius=float(rl_cfg.get("obstacle_radius", 4.0)),
         rl_progress_reward_scale=float(rl_cfg.get("progress_reward_scale", 4.0)),
         rl_goal_reward=float(rl_cfg.get("goal_reward", 10.0)),
         rl_collision_penalty=float(rl_cfg.get("collision_penalty", -10.0)),
+        rl_timeout_penalty=float(rl_cfg.get("timeout_penalty", -5.0)),
         rl_time_penalty=float(rl_cfg.get("time_penalty", -0.01)),
         rl_max_episode_steps=int(rl_cfg.get("max_episode_steps", 600)),
+        rl_map_size=int(rl_cfg.get("map_size", 24)),
+        rl_map_extent=float(rl_cfg.get("map_extent", 8.0)),
     )
     return CrowdNavigationManager(config)
 
@@ -429,6 +458,8 @@ def run_masked_mimic_with_robot_ppo(
     ppo = RobotPPOTrainer(
         RobotPPOConfig(
             obs_dim=nav_manager.robot_rl_obs_dim,
+            vector_obs_dim=nav_manager.robot_rl_vector_obs_dim,
+            map_size=nav_manager.config.rl_map_size,
             hidden_dim=int(rl_cfg.get("hidden_dim", 128)),
         ),
         nav_manager.config.device,

@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        default=None,
+        default="output/crowdsim_navigation/trajectory_latest.mp4",
         help="Output path. Defaults to trajectory_log with _fast.mp4.",
     )
     parser.add_argument("--fps", type=float, default=10.0)
@@ -332,7 +332,7 @@ def render_video(
                         interact_forces[agent_id],
                         INTERACT_ARROW_COLOR,
                         canvas,
-                        arrow_scale,
+                        arrow_scale*0.2,
                         width=2,
                     )
                     draw_world_arrow(

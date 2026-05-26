@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import argparse
-import csv
+from datetime import datetime
 from pathlib import Path
+import shutil
 import sys
 from typing import Any
 
@@ -18,12 +19,15 @@ AppLauncher = import_simulator_before_torch("isaaclab")
 
 import torch  # noqa: E402
 
+torch.set_float32_matmul_precision("high")
+
 from CrowdSim.utils.humanoid_state_recorder import (  # noqa: E402
     HumanoidStateRecorderConfig,
     configure_humanoid_state_recorder,
 )
 from CrowdSim.utils.map_metadata import OccupancyMapMetadata, load_occupancy_map_metadata  # noqa: E402
 from CrowdSim.navigation import CrowdNavigationConfig, CrowdNavigationManager  # noqa: E402
+from CrowdSim.differential_control import DifferentialDriveConfig  # noqa: E402
 from CrowdSim.robot_ppo import RobotPPOConfig, RobotPPOTrainer, RobotRolloutBuffer  # noqa: E402
 from CrowdSim.utils.sensor_stream import RobotCameraStreamConfig, configure_robot_camera_recorder  # noqa: E402
 from CrowdSim.sim_agent import (  # noqa: E402
@@ -57,8 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-config", default="CrowdSim/config/env.yaml")
     parser.add_argument("--ppo-config", default="CrowdSim/config/ppo.yaml")
     parser.add_argument("--num-envs", type=int, default=8)
-    parser.add_argument("--headless", action="store_true", default=True)
-    parser.add_argument("--render", action="store_true", help="Run with viewer instead of headless.")
+    parser.add_argument("--headless", action="store_true")
     parser.add_argument("--scene-physics", action="store_true")
     parser.add_argument("--total-steps", type=int, default=None)
     parser.add_argument("--rollout-steps", type=int, default=None)
@@ -75,7 +78,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    config = load_config(cfg_path(args.config or args.env_config))
+    env_config_path = cfg_path(args.config or args.env_config)
+    config = load_config(env_config_path)
     ppo_config_path = cfg_path(args.ppo_config)
     ppo_config = load_config(ppo_config_path) if ppo_config_path.exists() else {}
     merge_ppo_config(config, ppo_config)
@@ -89,6 +93,8 @@ def main() -> None:
     humanoid_cfg = config.get("humanoid", {})
     car_cfg = config.get("car", {})
     sensor_cfg = config.get("sensors", {})
+    if args.headless and isinstance(sensor_cfg.get("camera"), dict):
+        sensor_cfg["camera"]["enabled"] = False
 
     checkpoint = resolve_repo_path(humanoid_cfg["checkpoint"])
     motion_file = resolve_repo_path(humanoid_cfg["motion_file"])
@@ -108,7 +114,7 @@ def main() -> None:
         enable_human_mesh(hide_humanoid=bool(humanoid_cfg.get("hide_humanoid", False)))
 
     fabric = create_fabric()
-    headless = args.headless and not args.render
+    headless = args.headless
     launcher_args = {"headless": headless, "device": str(fabric.device)}
     if sensor_cfg.get("camera", {}).get("enabled", False):
         launcher_args["enable_cameras"] = True
@@ -158,21 +164,24 @@ def main() -> None:
 
     apply_fixed_spawn_offsets(env, nav_manager.humanoid_starts_xy)
     apply_fixed_crowd_robot_spawns(env, nav_manager.robot_starts_xy_yaw)
-    configure_robot_camera_recorder(
-        env,
-        RobotCameraStreamConfig(
-            output_dir=resolve_repo_path(
-                sensor_cfg.get("camera", {}).get("record_dir", "output/crowdsim_camera")
+    if sensor_cfg.get("camera", {}).get("enabled", False):
+        configure_robot_camera_recorder(
+            env,
+            RobotCameraStreamConfig(
+                output_dir=resolve_repo_path(
+                    sensor_cfg.get("camera", {}).get("record_dir", "output/crowdsim_camera")
+                ),
+                fps=float(sensor_cfg.get("camera", {}).get("record_fps", 10.0)),
+                env_ids=str(sensor_cfg.get("camera", {}).get("record_envs", "0")),
+                auto_record=bool(sensor_cfg.get("camera", {}).get("auto_record", False)),
             ),
-            fps=float(sensor_cfg.get("camera", {}).get("record_fps", 10.0)),
-            env_ids=str(sensor_cfg.get("camera", {}).get("record_envs", "0")),
-            auto_record=bool(sensor_cfg.get("camera", {}).get("auto_record", False)),
-        ),
-    )
+        )
     nav_manager.attach(env)
 
     ppo_cfg = RobotPPOConfig(
         obs_dim=nav_manager.robot_rl_obs_dim,
+        vector_obs_dim=nav_manager.robot_rl_vector_obs_dim,
+        map_size=nav_manager.config.rl_map_size,
         hidden_dim=int(config_value(args.hidden_dim, network_cfg, "hidden_dim", 128)),
         lr=float(config_value(args.lr, training_cfg, "lr", 3.0e-4)),
         ppo_epochs=int(config_value(args.ppo_epochs, training_cfg, "ppo_epochs", 4)),
@@ -191,6 +200,13 @@ def main() -> None:
         action_dim=2,
         device=fabric.device,
     )
+    base_output_dir = resolve_repo_path(
+        str(config_value(args.output_dir, training_cfg, "output_dir", "output/crowdsim_robot_ppo"))
+    )
+    output_dir = make_training_output_dir(base_output_dir)
+    copy_training_configs(output_dir, env_config_path, ppo_config_path)
+    print(f"[CrowdSim][PPO] Output directory: {output_dir}")
+
     train_loop(
         runtime=runtime,
         nav_manager=nav_manager,
@@ -199,9 +215,35 @@ def main() -> None:
         total_steps=int(config_value(args.total_steps, training_cfg, "total_steps", 200_000)),
         start_step=start_step,
         save_interval=int(config_value(args.save_interval, training_cfg, "save_interval", 20_000)),
-        output_dir=Path(config_value(args.output_dir, training_cfg, "output_dir", "output/crowdsim_robot_ppo")),
+        output_dir=output_dir,
         use_tensorboard=not args.no_tensorboard,
     )
+
+
+def make_training_output_dir(base_output_dir: Path) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = base_output_dir / timestamp
+    suffix = 1
+    while output_dir.exists():
+        output_dir = base_output_dir / f"{timestamp}_{suffix:02d}"
+        suffix += 1
+    output_dir.mkdir(parents=True, exist_ok=False)
+    latest_link = base_output_dir / "latest"
+    try:
+        if latest_link.is_symlink() or latest_link.exists():
+            latest_link.unlink()
+        latest_link.symlink_to(output_dir.name, target_is_directory=True)
+    except OSError:
+        pass
+    return output_dir
+
+
+def copy_training_configs(output_dir: Path, env_config_path: Path, ppo_config_path: Path) -> None:
+    config_dir = output_dir / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(env_config_path, config_dir / "env.yaml")
+    if ppo_config_path.exists():
+        shutil.copy2(ppo_config_path, config_dir / "ppo.yaml")
 
 
 def train_loop(
@@ -277,16 +319,21 @@ def train_loop(
         mean_length = sum(recent_lengths) / max(len(recent_lengths), 1)
         reached = info.get("reached", torch.zeros_like(robot_done)).float().mean().item()
         collision = info.get("collision", torch.zeros_like(robot_done)).float().mean().item()
-        sfm_reference_distance = info.get("sfm_reference_distance")
-        if sfm_reference_distance is None:
-            sfm_ref_distance = 0.0
-        else:
-            sfm_ref_distance = sfm_reference_distance.float().mean().item()
+        timeout = info.get("timeout", torch.zeros_like(robot_done)).float().mean().item()
+        goal_distance = info.get("distance_to_goal", torch.zeros_like(robot_reward)).float().mean().item()
+        progress = info.get("progress", torch.zeros_like(robot_reward)).float().mean().item()
+        reward_total = info.get("reward_total", robot_reward).float().mean().item()
+        reward_progress = info.get("reward_progress", torch.zeros_like(robot_reward)).float().mean().item()
+        reward_goal = info.get("reward_goal", torch.zeros_like(robot_reward)).float().mean().item()
+        reward_collision = info.get("reward_collision", torch.zeros_like(robot_reward)).float().mean().item()
+        reward_timeout = info.get("reward_timeout", torch.zeros_like(robot_reward)).float().mean().item()
+        reward_terminal = reward_goal + reward_collision + reward_timeout
         print(
             f"[CrowdSim][PPO] robot_steps={robot_steps} "
             f"return={mean_return:.3f} len={mean_length:.1f} "
-            f"reached={reached:.2f} collision={collision:.2f} "
-            f"sfm_ref_distance={sfm_ref_distance:.3f} "
+            f"reached={reached:.2f} collision={collision:.2f} timeout={timeout:.2f} "
+            f"goal_distance={goal_distance:.3f} progress={progress:.3f} "
+            f"reward={reward_total:.3f} progress_reward={reward_progress:.3f} "
             f"policy_loss={stats['policy_loss']:.4f} "
             f"value_loss={stats['value_loss']:.4f} entropy={stats['entropy']:.4f}"
         )
@@ -296,7 +343,12 @@ def train_loop(
             mean_length=mean_length,
             reached=reached,
             collision=collision,
-            sfm_ref_distance=sfm_ref_distance,
+            timeout=timeout,
+            goal_distance=goal_distance,
+            progress=progress,
+            reward_total=reward_total,
+            reward_progress=reward_progress,
+            reward_terminal=reward_terminal,
             policy_loss=stats["policy_loss"],
             value_loss=stats["value_loss"],
             entropy=stats["entropy"],
@@ -316,24 +368,6 @@ class RobotTrainingLogger:
     def __init__(self, output_dir: Path, use_tensorboard: bool) -> None:
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.csv_path = self.output_dir / "train_metrics.csv"
-        self.csv_file = self.csv_path.open("a", newline="", encoding="utf-8")
-        self.writer = csv.DictWriter(
-            self.csv_file,
-            fieldnames=[
-                "step",
-                "mean_return",
-                "mean_length",
-                "reached",
-                "collision",
-                "sfm_ref_distance",
-                "policy_loss",
-                "value_loss",
-                "entropy",
-            ],
-        )
-        if self.csv_path.stat().st_size == 0:
-            self.writer.writeheader()
 
         self.tb = None
         if use_tensorboard:
@@ -345,17 +379,48 @@ class RobotTrainingLogger:
                 print(f"[CrowdSim][PPO] TensorBoard disabled: {exc}")
 
     def log(self, step: int, **metrics: float) -> None:
-        row = {"step": step, **metrics}
-        self.writer.writerow(row)
-        self.csv_file.flush()
         if self.tb is not None:
-            for key, value in metrics.items():
-                self.tb.add_scalar(key, value, step)
+            self.tb.add_scalars(
+                "loss_entropy",
+                {
+                    "policy_loss": metrics["policy_loss"],
+                    "value_loss": metrics["value_loss"],
+                    "entropy": metrics["entropy"],
+                },
+                step,
+            )
+            self.tb.add_scalars(
+                "reward",
+                {
+                    "total": metrics["reward_total"],
+                    "progress": metrics["reward_progress"],
+                    "terminal": metrics["reward_terminal"],
+                },
+                step,
+            )
+            self.tb.add_scalars(
+                "outcome",
+                {
+                    "reached": metrics["reached"],
+                    "collision": metrics["collision"],
+                    "timeout": metrics["timeout"],
+                },
+                step,
+            )
+            self.tb.add_scalars(
+                "mean",
+                {
+                    "return": metrics["mean_return"],
+                    "length": metrics["mean_length"],
+                    "goal_distance": metrics["goal_distance"],
+                    "progress": metrics["progress"],
+                },
+                step,
+            )
 
     def close(self) -> None:
         if self.tb is not None:
             self.tb.close()
-        self.csv_file.close()
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -490,6 +555,7 @@ def build_navigation_manager(
             waypoint_tolerance=float(nav_cfg.get("waypoint_tolerance", 0.45)),
             goal_tolerance=float(nav_cfg.get("goal_tolerance", 0.75)),
             min_start_goal_distance=float(path_cfg.get("min_start_goal_distance", 5.0)),
+            max_start_goal_distance=float(path_cfg.get("max_start_goal_distance", 10.0)),
             min_spawn_spacing=float(path_cfg.get("min_spawn_spacing", 1.2)),
             planning_step_size=float(path_cfg.get("planning_step_size", 0.5)),
             planning_clearance=float(path_cfg.get("planning_clearance", 0.2)),
@@ -507,14 +573,16 @@ def build_navigation_manager(
             humanoid_target_min_heading_speed=float(
                 humanoid_cfg.get("min_heading_speed", 0.05)
             ),
+            differential_drive=DifferentialDriveConfig(),
             rl_num_neighbors=int(rl_cfg.get("num_neighbors", 4)),
-            rl_num_obstacles=int(rl_cfg.get("num_obstacles", 8)),
-            rl_obstacle_radius=float(rl_cfg.get("obstacle_radius", 4.0)),
             rl_progress_reward_scale=float(rl_cfg.get("progress_reward_scale", 4.0)),
             rl_goal_reward=float(rl_cfg.get("goal_reward", 10.0)),
             rl_collision_penalty=float(rl_cfg.get("collision_penalty", -10.0)),
+            rl_timeout_penalty=float(rl_cfg.get("timeout_penalty", -5.0)),
             rl_time_penalty=float(rl_cfg.get("time_penalty", -0.01)),
             rl_max_episode_steps=int(rl_cfg.get("max_episode_steps", 600)),
+            rl_map_size=int(rl_cfg.get("map_size", 24)),
+            rl_map_extent=float(rl_cfg.get("map_extent", 8.0)),
         )
     )
 

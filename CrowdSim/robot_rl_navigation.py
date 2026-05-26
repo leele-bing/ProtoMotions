@@ -43,7 +43,16 @@ class RobotRLNavigationMixin:
 
     @property
     def robot_rl_obs_dim(self) -> int:
-        return 8 + 5 * self.config.rl_num_neighbors + 3 * self.config.rl_num_obstacles
+        return self.robot_rl_vector_obs_dim + self.robot_rl_map_obs_dim
+
+    @property
+    def robot_rl_vector_obs_dim(self) -> int:
+        return 8 + 4 * self.config.rl_num_neighbors
+
+    @property
+    def robot_rl_map_obs_dim(self) -> int:
+        map_size = max(0, int(self.config.rl_map_size))
+        return map_size * map_size
 
     def reset_robot_rl_episodes(self, done: torch.Tensor | np.ndarray) -> None:
         if self.config.robot_control_mode.lower() != "rl" or self.config.num_robots == 0:
@@ -79,8 +88,8 @@ class RobotRLNavigationMixin:
         self.robot.reset(env_ids=env_ids)
 
         self._robot_rl_actions[robot_ids] = 0.0
-        self.waypoint_ids[agent_ids] = 1
-        self.reached[agent_ids] = False
+        for agent_id in agent_ids:
+            self._replan_agent_from_xy(int(agent_id), self.starts_xy[int(agent_id)])
         self._robot_episode_steps[robot_ids] = 0
         self._robot_prev_goal_dist[robot_ids] = np.linalg.norm(
             self.starts_xy[agent_ids] - self.goals_xy[agent_ids], axis=1
@@ -117,36 +126,37 @@ class RobotRLNavigationMixin:
 
         reached = self.reached[robot_agent_ids].copy()
         timeout = self._robot_episode_steps >= self.config.rl_max_episode_steps
+        time_reward = np.full(self.config.num_robots, self.config.rl_time_penalty, dtype=np.float32)
+        progress_reward = (self.config.rl_progress_reward_scale * progress).astype(np.float32)
+        goal_reward = (self.config.rl_goal_reward * reached.astype(np.float32)).astype(np.float32)
+        collision_reward = (
+            self.config.rl_collision_penalty * collision.astype(np.float32)
+        ).astype(np.float32)
+        timeout_reward = (self.config.rl_timeout_penalty * timeout.astype(np.float32)).astype(np.float32)
         rewards = (
-            self.config.rl_time_penalty
-            + self.config.rl_progress_reward_scale * progress
-            + self.config.rl_goal_reward * reached.astype(np.float32)
-            + self.config.rl_collision_penalty * collision.astype(np.float32)
+            time_reward
+            + progress_reward
+            + goal_reward
+            + collision_reward
+            + timeout_reward
         ).astype(np.float32)
         dones = reached | collision | timeout
 
         self._robot_last_obs = self._build_robot_rl_observations(positions, velocities)
         self._robot_last_rewards = torch.as_tensor(rewards, dtype=torch.float32, device=self.config.device)
         self._robot_last_dones = torch.as_tensor(dones, dtype=torch.bool, device=self.config.device)
-        sfm_reference_distance = np.linalg.norm(
-            self._robot_sfm_waypoints - positions[robot_agent_ids],
-            axis=1,
-        ).astype(np.float32)
         self._robot_last_info = {
             "reached": torch.as_tensor(reached, dtype=torch.bool, device=self.config.device),
             "collision": torch.as_tensor(collision, dtype=torch.bool, device=self.config.device),
             "timeout": torch.as_tensor(timeout, dtype=torch.bool, device=self.config.device),
             "distance_to_goal": torch.as_tensor(current_dist, dtype=torch.float32, device=self.config.device),
-            "sfm_reference_waypoint": torch.as_tensor(
-                self._robot_sfm_waypoints.copy(),
-                dtype=torch.float32,
-                device=self.config.device,
-            ),
-            "sfm_reference_distance": torch.as_tensor(
-                sfm_reference_distance,
-                dtype=torch.float32,
-                device=self.config.device,
-            ),
+            "progress": torch.as_tensor(progress, dtype=torch.float32, device=self.config.device),
+            "reward_total": torch.as_tensor(rewards, dtype=torch.float32, device=self.config.device),
+            "reward_time": torch.as_tensor(time_reward, dtype=torch.float32, device=self.config.device),
+            "reward_progress": torch.as_tensor(progress_reward, dtype=torch.float32, device=self.config.device),
+            "reward_goal": torch.as_tensor(goal_reward, dtype=torch.float32, device=self.config.device),
+            "reward_collision": torch.as_tensor(collision_reward, dtype=torch.float32, device=self.config.device),
+            "reward_timeout": torch.as_tensor(timeout_reward, dtype=torch.float32, device=self.config.device),
         }
 
     def _build_robot_rl_observations(
@@ -166,81 +176,87 @@ class RobotRLNavigationMixin:
             vel = velocities[agent_id]
             yaw = yaws[robot_idx]
 
-            waypoint_local = self._world_vec_to_local(self._current_waypoint(agent_id) - pos, yaw)
             goal_local = self._world_vec_to_local(self.goals_xy[agent_id] - pos, yaw)
             vel_local = self._world_vec_to_local(vel, yaw)
+            goal_norm = max(float(self.config.max_start_goal_distance), 1e-4)
+            goal_dist = float(np.linalg.norm(self.goals_xy[agent_id] - pos))
             row = [
-                waypoint_local[0] / max(self.config.neighbor_radius, 1e-4),
-                waypoint_local[1] / max(self.config.neighbor_radius, 1e-4),
-                goal_local[0] / max(self.config.min_start_goal_distance, 1e-4),
-                goal_local[1] / max(self.config.min_start_goal_distance, 1e-4),
+                goal_local[0] / goal_norm,
+                goal_local[1] / goal_norm,
                 vel_local[0] / max(self.config.max_speed, 1e-4),
                 vel_local[1] / max(self.config.max_speed, 1e-4),
                 math.sin(yaw),
                 math.cos(yaw),
+                goal_dist / goal_norm,
+                float(self._robot_episode_steps[robot_idx]) / max(float(self.config.rl_max_episode_steps), 1.0),
             ]
 
-            relpos = positions - pos
-            reldis = np.linalg.norm(relpos, axis=1)
-            mask = np.arange(self.num_agents) != agent_id
-            neighbor_ids = np.argsort(np.where(mask, reldis, np.inf))[: self.config.rl_num_neighbors]
-            for neighbor_id in neighbor_ids:
-                if not np.isfinite(reldis[neighbor_id]) or reldis[neighbor_id] > self.config.neighbor_radius:
-                    row.extend([0.0, 0.0, 0.0, 0.0, 0.0])
-                    continue
-                local_rel = self._world_vec_to_local(relpos[neighbor_id], yaw)
-                local_vel = self._world_vec_to_local(velocities[neighbor_id] - vel, yaw)
-                row.extend(
-                    [
-                        local_rel[0] / max(self.config.neighbor_radius, 1e-4),
-                        local_rel[1] / max(self.config.neighbor_radius, 1e-4),
-                        local_vel[0] / max(self.config.max_speed, 1e-4),
-                        local_vel[1] / max(self.config.max_speed, 1e-4),
-                        reldis[neighbor_id] / max(self.config.neighbor_radius, 1e-4),
-                    ]
-                )
+            row.extend(self._robot_rl_neighbor_observation(agent_id, pos, vel, yaw, positions, velocities))
 
-            obstacles = self._nearby_obstacles_world(pos)
-            obstacle_rows: list[np.ndarray] = []
-            if obstacles is not None and len(obstacles) > 0:
-                obstacle_rel = obstacles - pos
-                order = np.argsort(np.linalg.norm(obstacle_rel, axis=1))
-                obstacle_rows = [obstacle_rel[idx] for idx in order[: self.config.rl_num_obstacles]]
-            for obstacle_rel in obstacle_rows:
-                local_rel = self._world_vec_to_local(obstacle_rel, yaw)
-                dist = float(np.linalg.norm(obstacle_rel))
-                row.extend(
-                    [
-                        local_rel[0] / max(self.config.rl_obstacle_radius, 1e-4),
-                        local_rel[1] / max(self.config.rl_obstacle_radius, 1e-4),
-                        dist / max(self.config.rl_obstacle_radius, 1e-4),
-                    ]
-                )
-            for _ in range(self.config.rl_num_obstacles - len(obstacle_rows)):
-                row.extend([0.0, 0.0, 0.0])
+            if self.config.rl_map_size > 0:
+                row.extend(self._local_obstacle_patch(pos, yaw).reshape(-1).tolist())
 
             obs_rows.append(np.asarray(row, dtype=np.float32))
 
         obs = np.stack(obs_rows, axis=0)
         return torch.as_tensor(obs, dtype=torch.float32, device=self.config.device)
 
-    def _nearby_obstacles_world(self, xy: np.ndarray) -> np.ndarray | None:
-        pixel_yx = self.world_to_pixel(xy)
-        radius = int(math.ceil(self.config.rl_obstacle_radius / self.config.map_resolution))
-        y0 = max(0, int(pixel_yx[0]) - radius)
-        y1 = min(self.height, int(pixel_yx[0]) + radius + 1)
-        x0 = max(0, int(pixel_yx[1]) - radius)
-        x1 = min(self.width, int(pixel_yx[1]) + radius + 1)
+    def _robot_rl_neighbor_observation(
+        self,
+        agent_id: int,
+        pos: np.ndarray,
+        vel: np.ndarray,
+        yaw: float,
+        positions: np.ndarray,
+        velocities: np.ndarray,
+    ) -> list[float]:
+        relpos = positions - pos
+        reldis = np.linalg.norm(relpos, axis=1)
+        valid = (np.arange(self.num_agents) != agent_id) & (reldis <= self.config.neighbor_radius)
+        neighbor_ids = np.argsort(np.where(valid, reldis, np.inf))[: self.config.rl_num_neighbors]
 
-        region = self.obstacle_map[y0:y1, x0:x1]
-        obs_y, obs_x = np.nonzero(region)
-        if len(obs_y) == 0:
-            return None
+        values: list[float] = []
+        used = 0
+        for neighbor_id in neighbor_ids:
+            if not np.isfinite(reldis[neighbor_id]):
+                continue
+            local_rel = self._world_vec_to_local(relpos[neighbor_id], yaw)
+            local_vel = self._world_vec_to_local(velocities[neighbor_id] - vel, yaw)
+            values.extend(
+                [
+                    local_rel[0] / max(self.config.neighbor_radius, 1e-4),
+                    local_rel[1] / max(self.config.neighbor_radius, 1e-4),
+                    local_vel[0] / max(self.config.max_speed, 1e-4),
+                    local_vel[1] / max(self.config.max_speed, 1e-4),
+                ]
+            )
+            used += 1
 
-        pixels = np.column_stack([obs_y + y0, obs_x + x0])
-        dists = np.linalg.norm(pixels - pixel_yx[None, :], axis=1)
-        keep = np.argsort(dists)[: self.config.rl_num_obstacles]
-        return np.asarray([self.pixel_to_world(pixel) for pixel in pixels[keep]], dtype=np.float32)
+        for _ in range(self.config.rl_num_neighbors - used):
+            values.extend([0.0, 0.0, 0.0, 0.0])
+        return values
+
+    def _local_obstacle_patch(self, xy: np.ndarray, yaw: float) -> np.ndarray:
+        size = max(0, int(self.config.rl_map_size))
+        if size <= 0:
+            return np.zeros((0, 0), dtype=np.float32)
+        extent = max(float(self.config.rl_map_extent), self.config.map_resolution)
+        half = 0.5 * extent
+        cell = extent / float(size)
+        coords = (np.arange(size, dtype=np.float32) + 0.5) * cell - half
+        forward = np.array([math.cos(yaw), math.sin(yaw)], dtype=np.float32)
+        lateral = np.array([-math.sin(yaw), math.cos(yaw)], dtype=np.float32)
+        origin_x, origin_y = self.config.map_origin_xy
+        patch = np.ones((size, size), dtype=np.float32)
+
+        for row, local_x in enumerate(coords[::-1]):
+            for col, local_y in enumerate(coords):
+                world = xy + forward * local_x + lateral * local_y
+                pixel_x = int(round((float(world[0]) - origin_x) / self.config.map_resolution))
+                pixel_y = int(round((self.height - 1) - (float(world[1]) - origin_y) / self.config.map_resolution))
+                if 0 <= pixel_y < self.height and 0 <= pixel_x < self.width:
+                    patch[row, col] = float(self.obstacle_map[pixel_y, pixel_x] > 0)
+        return patch
 
     def _robot_goal_distances(self, positions: np.ndarray) -> np.ndarray:
         if self.config.num_robots == 0:

@@ -22,6 +22,7 @@ class NavigationTaskConfig:
     map_origin_xy: tuple[float, float] = (0.0, 0.0)
     seed: int = 7
     min_start_goal_distance: float = 5.0
+    max_start_goal_distance: float = 10.0
     min_spawn_spacing: float = 1.2
     planning_step_size: float = 0.5
     planning_clearance: float = 0.2
@@ -42,19 +43,19 @@ class NavigationTask:
             clearance_m=config.planning_clearance,
             smooth=False,
             viz=False,
+            verbose=False,
         )
         self.planner_free_mask = self.planner.map_dialate == 0
         self.component_labels, self.component_sizes = self._label_planner_free_space()
         self._component_pixel_cache: dict[int, np.ndarray] = {}
         self._markers: NavigationTaskMarkers | None = None
-        self.starts_px, self.goals_px = self._sample_start_goal_pixels()
+        self.starts_px, self.goals_px, self.paths_xy = self._sample_start_goal_paths()
         self.starts_xy = np.asarray(
             [self.pixel_to_world(px) for px in self.starts_px], dtype=np.float32
         )
         self.goals_xy = np.asarray(
             [self.pixel_to_world(px) for px in self.goals_px], dtype=np.float32
         )
-        self.paths_xy = self._plan_paths()
 
     def world_to_pixel(self, xy: np.ndarray) -> np.ndarray:
         origin_x, origin_y = self.config.map_origin_xy
@@ -90,14 +91,16 @@ class NavigationTask:
         obstacle_map = (~free_mask).astype(np.uint8)
         return free_mask, obstacle_map
 
-    def _sample_start_goal_pixels(self) -> tuple[np.ndarray, np.ndarray]:
+    def _sample_start_goal_paths(self) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
         free_pixels = [tuple(pixel) for pixel in np.column_stack(np.nonzero(self.planner_free_mask))]
         self.rng.shuffle(free_pixels)
 
         starts: list[np.ndarray] = []
         goals: list[np.ndarray] = []
+        paths: list[np.ndarray] = []
         min_spacing_px = self.config.min_spawn_spacing / self.config.map_resolution
         min_goal_px = self.config.min_start_goal_distance / self.config.map_resolution
+        max_goal_px = self.config.max_start_goal_distance / self.config.map_resolution
 
         for candidate in free_pixels:
             if len(starts) == self.config.num_agents:
@@ -111,34 +114,68 @@ class NavigationTask:
                 np.linalg.norm(candidate_array - np.asarray(point)) for point in starts
             ) < min_spacing_px:
                 continue
-            goal = self._sample_goal_for_start(candidate_array, min_goal_px)
-            if goal is None:
+            result = self._sample_goal_and_path_for_start(
+                candidate_array,
+                min_goal_px,
+                max_goal_px,
+                max_attempts=120,
+            )
+            if result is None:
                 continue
-            if not self._is_white_traversable(goal):
-                continue
+            goal, path_xy = result
             starts.append(candidate_array.copy())
             goals.append(goal)
+            paths.append(path_xy)
 
         if len(starts) < self.config.num_agents:
             raise RuntimeError(
                 f"Only sampled {len(starts)}/{self.config.num_agents} navigation starts "
-                "from the A* traversable white map area. Check scene_map, free_threshold, "
-                "or map connectivity."
+                "with valid A* paths from the traversable white map area. Check scene_map, "
+                "free_threshold, planning_clearance, planning_step_size, or map connectivity."
             )
 
-        return np.asarray(starts, dtype=np.int64), np.asarray(goals, dtype=np.int64)
+        return np.asarray(starts, dtype=np.int64), np.asarray(goals, dtype=np.int64), paths
 
-    def _sample_goal_for_start(self, start: np.ndarray, min_goal_px: float) -> np.ndarray | None:
+    def _sample_goal_for_start(
+        self, start: np.ndarray, min_goal_px: float, max_goal_px: float
+    ) -> np.ndarray | None:
+        result = self._sample_goal_and_path_for_start(
+            start,
+            min_goal_px,
+            max_goal_px,
+            max_attempts=2000,
+            plan_path=False,
+        )
+        return None if result is None else result[0]
+
+    def _sample_goal_and_path_for_start(
+        self,
+        start: np.ndarray,
+        min_goal_px: float,
+        max_goal_px: float,
+        max_attempts: int,
+        plan_path: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
         component_id = int(self.component_labels[tuple(start)])
         component_pixels = self._pixels_for_component(component_id)
         if len(component_pixels) == 0:
             return None
 
-        for _ in range(2000):
+        for _ in range(max_attempts):
             idx = self.rng.randrange(len(component_pixels))
             goal = component_pixels[idx]
-            if np.linalg.norm(goal - start) >= min_goal_px:
-                return goal.copy()
+            distance = np.linalg.norm(goal - start)
+            if not min_goal_px <= distance <= max_goal_px:
+                continue
+            if not self._is_white_traversable(goal):
+                continue
+            if not plan_path:
+                return goal.copy(), np.zeros((0, 2), dtype=np.float32)
+            path_px = self.planner.get_astar_path(start, goal)
+            if path_px is None or len(path_px) == 0:
+                continue
+            path_xy = np.asarray([self.pixel_to_world(px) for px in path_px], dtype=np.float32)
+            return goal.copy(), path_xy
         return None
 
     def _plan_paths(self) -> list[np.ndarray]:
@@ -157,6 +194,35 @@ class NavigationTask:
             )
             paths.append(path_xy)
         return paths
+
+    def sample_goal_and_plan_path(self, start_xy: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        start_px = self.world_to_pixel(start_xy)
+        if not self._is_white_traversable(start_px):
+            start_px = self._nearest_traversable_pixel(start_px)
+
+        min_goal_px = self.config.min_start_goal_distance / self.config.map_resolution
+        max_goal_px = self.config.max_start_goal_distance / self.config.map_resolution
+        result = self._sample_goal_and_path_for_start(
+            start_px,
+            min_goal_px,
+            max_goal_px,
+            max_attempts=200,
+        )
+        if result is not None:
+            goal_px, path_xy = result
+            return start_px, goal_px, path_xy
+
+        raise RuntimeError(
+            f"Failed to sample and plan a local goal near start_xy={np.asarray(start_xy).tolist()} "
+            f"within [{self.config.min_start_goal_distance}, {self.config.max_start_goal_distance}] m."
+        )
+
+    def _nearest_traversable_pixel(self, pixel_yx: np.ndarray) -> np.ndarray:
+        traversable = np.column_stack(np.nonzero(self.planner_free_mask))
+        if len(traversable) == 0:
+            raise RuntimeError("No traversable pixels available for navigation reset.")
+        dists = np.linalg.norm(traversable - pixel_yx[None, :], axis=1)
+        return traversable[int(np.argmin(dists))].astype(np.int64)
 
     def _is_white_traversable(self, pixel_yx: np.ndarray) -> bool:
         pixel = tuple(int(value) for value in pixel_yx)

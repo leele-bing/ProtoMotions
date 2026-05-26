@@ -20,6 +20,7 @@ class Path_Planner():
         clearance_m: float = 0.2,
         smooth=False,
         viz=False,
+        verbose: bool = True,
     ):
         self.map_resolution = float(map_resolution)
         self.step_size_m = float(step_size_m)
@@ -32,6 +33,7 @@ class Path_Planner():
         self.directions = self._build_directions(self.step_px)
 
         self.viz = viz
+        self.verbose = verbose
 
     def post_proc_map(self, map):
         kernel = np.ones((self.dilate_px, self.dilate_px), np.uint8)
@@ -68,7 +70,8 @@ class Path_Planner():
             else:
                 return control_points
         else:
-            print("[Astar] !!! No path found from start to goal.")
+            if self.verbose:
+                print("[Astar] !!! No path found from start to goal.")
             if self.viz:
                 self.viz_cost_and_path(distance, start, goal, path=None)
             return None

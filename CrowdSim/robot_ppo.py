@@ -16,6 +16,8 @@ class RobotPPOConfig:
     obs_dim: int
     action_dim: int = 2
     hidden_dim: int = 128
+    vector_obs_dim: int | None = None
+    map_size: int = 0
     lr: float = 3.0e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -28,27 +30,74 @@ class RobotPPOConfig:
 
 
 class RobotActorCritic(nn.Module):
-    def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int) -> None:
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        hidden_dim: int,
+        vector_obs_dim: int | None = None,
+        map_size: int = 0,
+    ) -> None:
         super().__init__()
-        self.actor = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
+        self.obs_dim = int(obs_dim)
+        self.vector_obs_dim = int(vector_obs_dim or obs_dim)
+        self.map_size = int(map_size)
+        self.map_obs_dim = self.map_size * self.map_size
+        self.has_map = (
+            self.map_size > 0
+            and self.vector_obs_dim + self.map_obs_dim <= self.obs_dim
+        )
+        self.vector_encoder = nn.Sequential(
+            nn.Linear(self.vector_obs_dim, hidden_dim),
             nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
+        )
+        feature_dim = hidden_dim
+        if self.has_map:
+            self.map_encoder = nn.Sequential(
+                nn.Conv2d(1, 8, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(),
+                nn.Flatten(),
+            )
+            with torch.no_grad():
+                dummy = torch.zeros(1, 1, self.map_size, self.map_size)
+                map_feature_dim = int(self.map_encoder(dummy).shape[-1])
+            self.map_projection = nn.Sequential(
+                nn.Linear(map_feature_dim, hidden_dim),
+                nn.Tanh(),
+            )
+            feature_dim += hidden_dim
+        else:
+            self.map_encoder = None
+            self.map_projection = None
+
+        self.actor = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
             nn.Tanh(),
             nn.Linear(hidden_dim, action_dim),
         )
         self.critic = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(feature_dim, hidden_dim),
             nn.Tanh(),
             nn.Linear(hidden_dim, 1),
         )
         self.log_std = nn.Parameter(torch.full((action_dim,), -0.5))
 
+    def encode(self, obs: torch.Tensor) -> torch.Tensor:
+        vector_obs = obs[:, : self.vector_obs_dim]
+        features = [self.vector_encoder(vector_obs)]
+        if self.has_map:
+            map_start = self.vector_obs_dim
+            map_end = map_start + self.map_obs_dim
+            map_obs = obs[:, map_start:map_end].reshape(-1, 1, self.map_size, self.map_size)
+            features.append(self.map_projection(self.map_encoder(map_obs)))
+        return torch.cat(features, dim=-1) if len(features) > 1 else features[0]
+
     def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        mean = self.actor(obs)
-        value = self.critic(obs).squeeze(-1)
+        features = self.encode(obs)
+        mean = self.actor(features)
+        value = self.critic(features).squeeze(-1)
         log_std = self.log_std.expand_as(mean)
         return mean, log_std, value
 
@@ -169,6 +218,8 @@ class RobotPPOTrainer:
             obs_dim=config.obs_dim,
             action_dim=config.action_dim,
             hidden_dim=config.hidden_dim,
+            vector_obs_dim=config.vector_obs_dim,
+            map_size=config.map_size,
         ).to(device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.lr)
 
