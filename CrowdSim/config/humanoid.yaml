@@ -1,9 +1,8 @@
 scene:
   prim_path: /World/Scene
   z_offset: 0.0
-  scene_usd: ../Assets/Warehouse/warehouse_floor.usd
-  scene_map: ../Assets/Warehouse/warehouse.yaml
-  terrain_xy_offset: [-125.0, -125.0]
+  scene_usd: ../Assets/Office/office.usd
+  scene_map: ../Assets/Office/office.yaml
 
 
 humanoid:
@@ -25,12 +24,11 @@ humanoid:
 
 
 car:
-  usd: nova_carter #jetbot
+  usd: null #nova_carter #jetbot
   prim_name: Car
   z: 0.0
   spawn_xy: null
-  rl_policy: true
-  drive_mode: kinematic
+  rl_policy: false
   policy_checkpoint: output/crowdsim_robot_ppo/latest/robot_ppo_latest.pt
 
 
@@ -86,5 +84,5 @@ markers:
 
 viewer:
   camera_mode: free
-  camera_eye: [8.0, -8.0, 15.0]
+  camera_eye: [8.0, -8.0, 20.0]
   camera_target: [0.0, 0.0, 1.0]

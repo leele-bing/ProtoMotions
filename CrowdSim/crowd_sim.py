@@ -147,6 +147,19 @@ def cfg_path(path_like: str) -> Path:
     return (PROJECT_ROOT / path).resolve()
 
 
+def parse_xy_pair(value) -> tuple[float, float] | None:
+    if value is None:
+        return None
+    values = (
+        [item.strip() for item in value.split(",")]
+        if isinstance(value, str)
+        else list(value)
+    )
+    if len(values) != 2:
+        raise ValueError(f"Expected two XY values, got {value!r}")
+    return float(values[0]), float(values[1])
+
+
 def main() -> None:
     args = parse_args()
     config = load_config(cfg_path(args.env_config))
@@ -190,12 +203,14 @@ def main() -> None:
     scene_loaded_in_scene_cfg = args.scene_physics or crowd_robot_config is not None
     scene_prim_path = str(scene_cfg.get("prim_path", "/World/Scene"))
     scene_z_offset = float(scene_cfg.get("z_offset", 0.0))
+    terrain_xy_offset = parse_xy_pair(scene_cfg.get("terrain_xy_offset"))
     if scene_loaded_in_scene_cfg:
         patch_isaaclab_scene_with_crowdsim_assets(
             scene_usd_path=scene_usd,
             scene_z_offset=scene_z_offset,
             scene_prim_path=scene_prim_path,
             crowd_robot=crowd_robot_config,
+            terrain_xy_offset=terrain_xy_offset,
         )
 
     runtime = build_runtime(
@@ -423,6 +438,7 @@ def build_navigation_manager(
         ),
         differential_drive=make_differential_drive_config(rl_cfg),
         car_rl_policy=bool(car_cfg.get("rl_policy", True)),
+        car_drive_mode=str(car_cfg.get("drive_mode", "wheel")),
         rl_num_neighbors=int(rl_cfg.get("num_neighbors", 4)),
         rl_max_linear_velocity=float(rl_cfg.get("max_linear_velocity", 2.0)),
         rl_max_angular_velocity=float(rl_cfg.get("max_angular_velocity", 2.0)),
@@ -452,14 +468,14 @@ def run_masked_mimic_with_robot_ppo(
             "Train a policy with CrowdSim/train_robot_ppo.py first, then point this field at the checkpoint."
         )
 
-    from CrowdSim.robot_ppo import RobotPPOConfig, RobotPPOTrainer
+    from CrowdSim.robot_ppo import RobotPPOConfig, RobotPPOTrainer, robot_network_kwargs
 
     ppo = RobotPPOTrainer(
         RobotPPOConfig(
             obs_dim=nav_manager.robot_rl_obs_dim,
             vector_obs_dim=nav_manager.robot_rl_vector_obs_dim,
             map_size=nav_manager.config.rl_map_size,
-            hidden_dim=int(get_network_config(cfg).get("hidden_dim", 128)),
+            **robot_network_kwargs(get_network_config(cfg)),
         ),
         nav_manager.config.device,
     )

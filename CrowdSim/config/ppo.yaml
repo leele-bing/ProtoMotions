@@ -8,19 +8,27 @@ rl:
 
   reward:
     progress_reward_scale: 3.0
-    goal_reward: 100.0
+    goal_reward: 50.0
     collision_penalty: -50.0
     timeout_penalty: -50.0
     time_penalty: -0.1
-    max_episode_steps: 400
+    max_episode_steps: 300
   
 
 network:
-  hidden_dim: 256
-  num_layers: 2
+  hidden_dims: [256, 512, 256]
+  vector_hidden_dims: [128, 128]
+  map_projection_hidden_dims: [256]
+  actor_hidden_dims: [256, 128, 32]
+  critic_hidden_dims: [256, 128, 32]
+  map_encoder:
+    channels: [8, 16, 8]
+    kernel_sizes: [3, 3, 3]
+    strides: [2, 2, 1]
+    paddings: [1, 1, 1]
 
 training:
-  total_steps: 200000
+  total_steps: 500000
   rollout_steps: 256
   ppo_epochs: 4
   minibatch_size: 256

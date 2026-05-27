@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
 import sys
 
@@ -15,13 +16,26 @@ from protomotions.utils.simulator_imports import import_simulator_before_torch  
 AppLauncher = import_simulator_before_torch("isaaclab")
 
 
+@dataclass(frozen=True)
+class NewGroundConfig:
+    prim: str = "CrowdSimGround"
+    z: float = 0.0
+    size: tuple[float, float] = (400.0, 400.0)
+    color: tuple[float, float, float] | None = (0.2, 0.2, 0.2)
+    static_friction: float = 1.5
+    dynamic_friction: float = 1.5
+    restitution: float = 0.0
+    friction_combine_mode: str = "max"
+    restitution_combine_mode: str = "average"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Filter a USD scene using keyword-matched prim paths.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--input-usd", default="/home/pcl/amp/Assets/Warehouse/warehouse.usd")
-    parser.add_argument("--output-usd", default="/home/pcl/amp/Assets/Warehouse/warehouse_removed.usd")
+    parser.add_argument("--input-usd", default="/home/pcl/amp/Assets/Warehouse/warehouse_removed.usd")
+    parser.add_argument("--output-usd", default="/home/pcl/amp/Assets/Warehouse/warehouse_floor.usd")
     parser.add_argument(
         "--root-prim",
         default=None,
@@ -34,6 +48,50 @@ def parse_args() -> argparse.Namespace:
         default="deactivate",
         help="remove deletes matched prims; deactivate authors active=false opinions.",
     )
+    parser.add_argument(
+        "--new-ground",
+        action="store_true",
+        help="Add a generated flat ground plane mesh to the output USD.",
+    )
+    parser.add_argument(
+        "--ground-prim",
+        default="CrowdSimGround",
+        help="Ground prim path, or a prim name to create under the detected scene root.",
+    )
+    parser.add_argument(
+        "--ground-z",
+        type=float,
+        default=0.0,
+        help="Ground plane z position.",
+    )
+    parser.add_argument(
+        "--ground-size",
+        nargs=2,
+        type=float,
+        metavar=("X", "Y"),
+        default=(400.0, 400.0),
+        help="Ground plane size. The default covers x/y -200..200 around the origin.",
+    )
+    parser.add_argument("--ground-static-friction", type=float, default=1.5)
+    parser.add_argument("--ground-dynamic-friction", type=float, default=1.5)
+    parser.add_argument("--ground-restitution", type=float, default=0.0)
+    parser.add_argument(
+        "--ground-friction-combine-mode",
+        choices=("average", "min", "multiply", "max"),
+        default="max",
+    )
+    parser.add_argument(
+        "--ground-restitution-combine-mode",
+        choices=("average", "min", "multiply", "max"),
+        default="average",
+    )
+    parser.add_argument(
+        "--ground-color",
+        nargs=3,
+        type=float,
+        metavar=("R", "G", "B"),
+        default=(0.2, 0.2, 0.2),
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -44,6 +102,7 @@ def main() -> None:
     output_usd = resolve_path(args.output_usd) if args.output_usd else default_output_path(input_usd)
     root_prim = str(args.root_prim) if args.root_prim else None
     keywords = tuple(args.keywords)
+    ground_config = make_ground_config(args) if args.new_ground else None
 
     app_launcher = AppLauncher({"headless": True})
     try:
@@ -54,6 +113,7 @@ def main() -> None:
             keywords=keywords,
             mode=args.mode,
             dry_run=args.dry_run,
+            new_ground=ground_config,
         )
         action = "Would filter" if args.dry_run else "Filtered"
         print(f"[CrowdSim] {action} {len(matched)} prim(s) from {input_usd}", flush=True)
@@ -61,6 +121,13 @@ def main() -> None:
             print(f"  {path}", flush=True)
         if len(matched) > 80:
             print(f"  ... {len(matched) - 80} more", flush=True)
+        if args.new_ground:
+            ground_action = "Would add" if args.dry_run else "Added"
+            print(
+                f"[CrowdSim] {ground_action} ground: "
+                f"size={tuple(args.ground_size)}, z={args.ground_z}",
+                flush=True,
+            )
         if not args.dry_run:
             print(f"[CrowdSim] Saved filtered USD: {output_usd}", flush=True)
     finally:
@@ -74,10 +141,10 @@ def filter_usd_scene(
     keywords: tuple[str, ...],
     mode: str,
     dry_run: bool,
+    new_ground: NewGroundConfig | None = None,
 ) -> list[str]:
     import omni.usd
     from isaaclab.sim.utils import stage as stage_utils
-    from pxr import Usd
 
     if not input_usd.exists():
         raise FileNotFoundError(f"Input USD not found: {input_usd}")
@@ -115,11 +182,86 @@ def filter_usd_scene(
             if prim.IsValid():
                 prim.SetActive(False)
 
+    if new_ground is not None:
+        add_default_ground(stage, root_prim_path, new_ground)
+
     stage_utils.update_stage()
     saved = stage_utils.save_stage(str(output_usd), save_and_reload_in_place=False)
     if not saved:
         raise RuntimeError(f"Failed to save filtered USD: {output_usd}")
     return matched
+
+
+def make_ground_config(args: argparse.Namespace) -> NewGroundConfig:
+    return NewGroundConfig(
+        prim=str(args.ground_prim),
+        z=float(args.ground_z),
+        size=(float(args.ground_size[0]), float(args.ground_size[1])),
+        color=tuple(float(value) for value in args.ground_color),
+        static_friction=float(args.ground_static_friction),
+        dynamic_friction=float(args.ground_dynamic_friction),
+        restitution=float(args.ground_restitution),
+        friction_combine_mode=str(args.ground_friction_combine_mode),
+        restitution_combine_mode=str(args.ground_restitution_combine_mode),
+    )
+
+
+def add_default_ground(stage, root_prim_path: str, ground: NewGroundConfig) -> str:
+    import isaaclab.sim as sim_utils
+    from isaaclab.sim.utils import bind_physics_material
+    from isaaclab.sim.utils import stage as stage_utils
+    from pxr import Gf, UsdGeom, UsdPhysics
+
+    ground_path = resolve_ground_prim_path(root_prim_path, ground.prim)
+    if stage.GetPrimAtPath(ground_path).IsValid():
+        stage.RemovePrim(ground_path)
+        stage_utils.update_stage()
+
+    ground_xform = UsdGeom.Xform.Define(stage, ground_path)
+    UsdGeom.XformCommonAPI(ground_xform).SetTranslate((0.0, 0.0, ground.z))
+
+    half_x = 0.5 * ground.size[0]
+    half_y = 0.5 * ground.size[1]
+    mesh_path = f"{ground_path}/Plane"
+    mesh = UsdGeom.Mesh.Define(stage, mesh_path)
+    mesh.CreatePointsAttr(
+        [
+            Gf.Vec3f(-half_x, -half_y, 0.0),
+            Gf.Vec3f(half_x, -half_y, 0.0),
+            Gf.Vec3f(half_x, half_y, 0.0),
+            Gf.Vec3f(-half_x, half_y, 0.0),
+        ]
+    )
+    mesh.CreateFaceVertexCountsAttr([4])
+    mesh.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
+    mesh.CreateExtentAttr(
+        [Gf.Vec3f(-half_x, -half_y, 0.0), Gf.Vec3f(half_x, half_y, 0.0)]
+    )
+    mesh.CreateSubdivisionSchemeAttr("none")
+    if ground.color is not None:
+        mesh.CreateDisplayColorAttr([Gf.Vec3f(*ground.color)])
+
+    mesh_prim = mesh.GetPrim()
+    UsdPhysics.CollisionAPI.Apply(mesh_prim)
+    UsdPhysics.MeshCollisionAPI.Apply(mesh_prim).GetApproximationAttr().Set("none")
+
+    material_path = f"{ground_path}/physicsMaterial"
+    material_cfg = sim_utils.RigidBodyMaterialCfg(
+        static_friction=ground.static_friction,
+        dynamic_friction=ground.dynamic_friction,
+        restitution=ground.restitution,
+        friction_combine_mode=ground.friction_combine_mode,
+        restitution_combine_mode=ground.restitution_combine_mode,
+    )
+    material_cfg.func(material_path, material_cfg)
+    bind_physics_material(mesh_path, material_path, stage=stage)
+    return ground_path
+
+
+def resolve_ground_prim_path(root_prim_path: str, ground_prim: str) -> str:
+    if ground_prim.startswith("/"):
+        return ground_prim
+    return f"{root_prim_path.rstrip('/')}/{ground_prim}"
 
 
 def find_keyword_matched_prims(stage, root_prim, keywords: tuple[str, ...]) -> list[str]:

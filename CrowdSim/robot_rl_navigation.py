@@ -7,6 +7,9 @@ import math
 import numpy as np
 import torch
 
+DEBUG_ROBOT_DRIVE = False
+DEBUG_CONSTANT_ROBOT_COMMAND: tuple[float, float] | None = None
+
 
 class RobotRLNavigationMixin:
     """Mixin for robot-only PPO observations, rewards, and episode resets."""
@@ -47,6 +50,148 @@ class RobotRLNavigationMixin:
 
         self.robot.set_joint_velocity_target(targets, joint_ids=self._wheel_joint_ids)
 
+    def _override_robot_rl_actions_with_constant_command(self) -> None:
+        if not self.config.car_rl_policy or self.config.num_robots == 0:
+            return
+
+        if DEBUG_CONSTANT_ROBOT_COMMAND is None:
+            return
+
+        command = np.asarray(DEBUG_CONSTANT_ROBOT_COMMAND, dtype=np.float32)
+        if command.shape != (2,):
+            raise ValueError(
+                "DEBUG_CONSTANT_ROBOT_COMMAND must have shape (2,) for "
+                "(linear_velocity, angular_velocity)."
+            )
+        action = np.array(
+            [
+                float(command[0]) / max(float(self.config.rl_max_linear_velocity), 1e-6),
+                float(command[1]) / max(float(self.config.rl_max_angular_velocity), 1e-6),
+            ],
+            dtype=np.float32,
+        )
+        self._robot_rl_actions[:] = np.clip(action, -1.0, 1.0)
+
+    def _robot_actions_to_velocity_commands(self) -> np.ndarray:
+        commands = np.zeros_like(self._robot_rl_actions, dtype=np.float32)
+        commands[:, 0] = (
+            np.clip(self._robot_rl_actions[:, 0], -1.0, 1.0)
+            * float(self.config.rl_max_linear_velocity)
+        )
+        commands[:, 1] = (
+            np.clip(self._robot_rl_actions[:, 1], -1.0, 1.0)
+            * float(self.config.rl_max_angular_velocity)
+        )
+        return commands
+
+    def _robot_drive_debug_enabled(self) -> bool:
+        return DEBUG_ROBOT_DRIVE or DEBUG_CONSTANT_ROBOT_COMMAND is not None
+
+    def _apply_robot_drive_after_env_step(self) -> None:
+        if not self.config.car_rl_policy or self.config.num_robots == 0:
+            return
+        if self.config.car_drive_mode != "kinematic":
+            return
+
+        self._clear_robot_wheel_targets()
+        commands = self._robot_actions_to_velocity_commands()
+        yaws = self._robot_yaws()
+        dt = float(getattr(self, "_env_dt", 0.0) or 0.0)
+        if dt <= 0.0:
+            dt = 1.0 / 30.0
+
+        linear = commands[:, 0]
+        angular = commands[:, 1]
+        yaw_mid = yaws + 0.5 * angular * dt
+        next_yaws = yaws + angular * dt
+
+        poses = torch.cat(
+            (
+                self.robot.data.root_pos_w[:, :3].clone(),
+                self.robot.data.root_quat_w[:, :4].clone(),
+            ),
+            dim=1,
+        )
+        poses[:, 0] += torch.as_tensor(
+            linear * np.cos(yaw_mid) * dt,
+            dtype=torch.float32,
+            device=self.config.device,
+        )
+        poses[:, 1] += torch.as_tensor(
+            linear * np.sin(yaw_mid) * dt,
+            dtype=torch.float32,
+            device=self.config.device,
+        )
+        poses[:, 3:7] = self._yaw_to_quat_tensor(
+            torch.as_tensor(next_yaws, dtype=torch.float32, device=self.config.device)
+        )
+
+        velocities = torch.zeros(
+            (self.config.num_robots, 6),
+            dtype=torch.float32,
+            device=self.config.device,
+        )
+        velocities[:, 0] = torch.as_tensor(
+            linear * np.cos(next_yaws),
+            dtype=torch.float32,
+            device=self.config.device,
+        )
+        velocities[:, 1] = torch.as_tensor(
+            linear * np.sin(next_yaws),
+            dtype=torch.float32,
+            device=self.config.device,
+        )
+        velocities[:, 5] = torch.as_tensor(
+            angular,
+            dtype=torch.float32,
+            device=self.config.device,
+        )
+
+        self.robot.write_root_pose_to_sim(poses)
+        self.robot.write_root_velocity_to_sim(velocities)
+
+    def _print_robot_drive_debug(self) -> None:
+        if not self.config.car_rl_policy or self.config.num_robots == 0:
+            return
+        if not self._robot_drive_debug_enabled():
+            return
+        if self._wheel_targets_tensor is None:
+            return
+
+        actual_wheel_velocities = None
+        if self._wheel_joint_ids is not None and hasattr(self.robot.data, "joint_vel"):
+            actual_wheel_velocities = (
+                self.robot.data.joint_vel[:, self._wheel_joint_ids].detach().cpu().numpy()
+            )
+
+        print(
+            "[CrowdSim][RobotDrive] "
+            f"command_vw={self._robot_actions_to_velocity_commands().tolist()} "
+            f"wheel_targets={self._wheel_targets_tensor.detach().cpu().numpy().tolist()} "
+            f"actual_wheel_velocities="
+            f"{None if actual_wheel_velocities is None else actual_wheel_velocities.tolist()}"
+        )
+
+    def _clear_robot_wheel_targets(self, env_ids: torch.Tensor | None = None) -> None:
+        if self._wheel_targets_tensor is None or self._wheel_joint_ids is None:
+            return
+
+        if env_ids is None:
+            self._wheel_targets_tensor.zero_()
+            targets = self._wheel_targets_tensor
+        else:
+            self._wheel_targets_tensor[env_ids] = 0.0
+            targets = torch.zeros(
+                (int(env_ids.numel()), len(self._wheel_joint_ids)),
+                dtype=torch.float32,
+                device=self.config.device,
+            )
+        self.robot.set_joint_velocity_target(
+            targets,
+            joint_ids=self._wheel_joint_ids,
+            env_ids=env_ids,
+        )
+
     def get_robot_rl_observations(self) -> torch.Tensor:
         positions, velocities = self._read_agent_state()
         obs = self._build_robot_rl_observations(positions, velocities)
@@ -62,6 +207,29 @@ class RobotRLNavigationMixin:
             self._robot_last_dones,
             self._robot_last_info,
         )
+
+    def _clear_robot_rl_env_step_feedback(self) -> None:
+        if not self.config.car_rl_policy or self.config.num_robots == 0:
+            return
+
+        self._robot_last_rewards.zero_()
+        self._robot_last_dones.zero_()
+        zero_float = torch.zeros(self.config.num_robots, dtype=torch.float32, device=self.config.device)
+        zero_bool = torch.zeros(self.config.num_robots, dtype=torch.bool, device=self.config.device)
+        self._robot_last_info = {
+            **self._robot_last_info,
+            "is_navigation_step": zero_bool,
+            "reached": zero_bool,
+            "collision": zero_bool,
+            "timeout": zero_bool,
+            "progress": zero_float,
+            "reward_total": zero_float,
+            "reward_time": zero_float,
+            "reward_progress": zero_float,
+            "reward_goal": zero_float,
+            "reward_collision": zero_float,
+            "reward_timeout": zero_float,
+        }
 
     @property
     def robot_rl_obs_dim(self) -> int:
@@ -87,6 +255,10 @@ class RobotRLNavigationMixin:
         if len(robot_ids) == 0:
             return
 
+        reset_reasons = {
+            int(robot_id): self._robot_reset_reason(int(robot_id))
+            for robot_id in robot_ids
+        }
         agent_offset = self.config.num_humanoids
         agent_ids = agent_offset + robot_ids
         yaw = self._initial_robot_yaws()[robot_ids]
@@ -108,10 +280,17 @@ class RobotRLNavigationMixin:
             env_ids=env_ids,
         )
         self.robot.reset(env_ids=env_ids)
+        self._clear_robot_wheel_targets(env_ids)
 
         self._robot_rl_actions[robot_ids] = 0.0
         for agent_id in agent_ids:
             self._replan_agent_from_xy(int(agent_id), self.starts_xy[int(agent_id)])
+        for robot_id in robot_ids:
+            print(
+                "[CrowdSim] reset car "
+                f"env={int(robot_id)} agent={int(agent_offset + robot_id)} "
+                f"reason={reset_reasons[int(robot_id)]}"
+            )
         self._robot_episode_steps[robot_ids] = 0
         self._robot_progress_targets[robot_ids] = self.starts_xy[agent_ids]
         self._robot_prev_progress_dist[robot_ids] = 0.0
@@ -121,6 +300,23 @@ class RobotRLNavigationMixin:
             for pair in self.collision_pairs
             if pair[0] not in agent_id_set and pair[1] not in agent_id_set
         }
+        self._robot_last_rewards[env_ids] = 0.0
+        self._robot_last_dones[env_ids] = False
+        for value in self._robot_last_info.values():
+            if isinstance(value, torch.Tensor) and value.shape[:1] == (self.config.num_robots,):
+                if value.dtype == torch.bool:
+                    value[env_ids] = False
+                else:
+                    value[env_ids] = 0.0
+
+    def _robot_reset_reason(self, robot_id: int) -> str:
+        reasons = []
+        for key in ("reached", "collision", "timeout"):
+            value = self._robot_last_info.get(key)
+            if isinstance(value, torch.Tensor) and value.numel() > robot_id:
+                if bool(value[robot_id].detach().cpu().item()):
+                    reasons.append(key)
+        return "+".join(reasons) if reasons else "external"
 
     def _update_robot_rl_feedback(
         self,
@@ -187,6 +383,11 @@ class RobotRLNavigationMixin:
             "reward_goal": torch.as_tensor(goal_reward, dtype=torch.float32, device=self.config.device),
             "reward_collision": torch.as_tensor(collision_reward, dtype=torch.float32, device=self.config.device),
             "reward_timeout": torch.as_tensor(timeout_reward, dtype=torch.float32, device=self.config.device),
+            "is_navigation_step": torch.ones(
+                self.config.num_robots,
+                dtype=torch.bool,
+                device=self.config.device,
+            ),
         }
 
     def _build_robot_rl_observations(

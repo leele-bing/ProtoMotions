@@ -357,6 +357,42 @@ total_obs_dim = 600
 
 静态障碍物不再通过 `num_obstacles` 点列表表示，而是完全由局部 occupancy map 表示。动态障碍物，也就是 humanoid 和 car 邻居，仍然通过 `num_neighbors` 的相对位置和相对速度表示。
 
+### RL Network
+
+网络规模在 `ppo.yaml` 中配置：
+
+```yaml
+network:
+  hidden_dims: [256, 512]
+  vector_hidden_dims: [256, 512]
+  map_projection_hidden_dims: [256, 256]
+  actor_hidden_dims: [512, 256]
+  critic_hidden_dims: [512, 256]
+  map_encoder:
+    channels: [8, 16]
+    kernel_sizes: [3, 3]
+    strides: [2, 2]
+    paddings: [1, 1]
+```
+
+- `hidden_dims`：默认 MLP 层宽列表；如果某个模块没有单独配置，就使用它。
+- `vector_hidden_dims`：vector observation encoder 的 MLP 层宽。
+- `map_projection_hidden_dims`：CNN map feature 投影 MLP 的层宽。
+- `actor_hidden_dims`：actor head 的 MLP 层宽。
+- `critic_hidden_dims`：critic head 的 MLP 层宽。
+- `map_encoder.channels`：局部 occupancy map CNN 每层输出通道数。
+- `map_encoder.kernel_sizes` / `strides` / `paddings`：CNN 每层卷积参数。可以写单个数，也可以写与 `channels` 等长的列表。
+
+兼容旧写法：
+
+```yaml
+network:
+  hidden_dim: 256
+  num_layers: 2
+```
+
+旧写法会展开为 `[256, 256]`。增大或改变这些网络参数会改变 checkpoint 结构；旧 checkpoint 通常不能直接加载，需要重新训练，或者把配置改回旧网络规模再加载。
+
 ### RL Reward 和 Done
 
 PPO reward 当前由以下部分组成：
@@ -400,14 +436,14 @@ output/crowdsim_robot_ppo/YYYYmmdd_HHMMSS/
 
 `output/crowdsim_robot_ppo/latest` 会指向最近一次训练 run。
 
-TensorBoard 当前按四组 tag 前缀组织，每个指标单独成图：
+TensorBoard 当前按环境统计的语义分成三组 tag 前缀，每个指标单独成图；PPO 优化器 loss 单独保留在 `loss/*`：
 
 - `loss/*`：`policy_loss`、`value_loss`、`entropy`。
-- `reward/*`：`total`、`progress`、`terminal`。
-- `outcome/*`：`reached`、`collision`、`timeout`。
-- `mean/*`：`return`、`length`、`goal_distance`、`progress_target_distance`、`progress`。
+- `step/*`：当前 rollout 内 navigation step 的平均单步统计，包括 `reward_total`、`reward_progress`、`reward_terminal`、`progress`、`goal_distance`、`progress_target_distance`。非 navigation env step 的 reward/done 会记为 0/False，不重复累计上一帧 reward。
+- `episode/*`：最近完成 episode 的平均统计，包括 `return`、`length`。
+- `outcome/*`：当前 rollout 内的事件出现次数，包括 `reached`、`collision`、`timeout`。
 
-其中 `terminal = reward_goal + reward_collision + reward_timeout`。`reached` / `collision` / `timeout` 已经表达了终止事件比例，所以不再把对应的 reward 分量单独画成三张图；`reward_time` 是每步常数，也不单独记录。
+其中 `terminal = reward_goal + reward_collision + reward_timeout`。`reached` / `collision` / `timeout` 已经表达了终止事件次数，所以不再把对应的 reward 分量单独画成三张图；`reward_time` 是每步常数，也不单独记录。
 
 查看 TensorBoard：
 

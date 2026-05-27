@@ -83,7 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--stride", type=int, default=1, help="Use every Nth recorded frame.")
     parser.add_argument("--max-frames", type=int, default=0, help="0 means use all frames.")
-    parser.add_argument("--trail-length", type=int, default=200)
+    parser.add_argument("--trail-length", type=int, default=400)
     parser.add_argument(
         "--crop-center-pixels",
         type=int,
@@ -99,7 +99,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sfm-arrow-scale",
         type=float,
-        default=2,
+        default=1,
         help="World-space scale applied to SFM vector arrows.",
     )
     parser.add_argument("--no-sfm-arrows", action="store_true")
@@ -142,9 +142,6 @@ def main() -> None:
         path_data=path_data,
         metadata=metadata,
         crop_center_pixels=max(0, int(args.crop_center_pixels)),
-        line_width=max(1, int(args.line_width)),
-        target_size=max(2, int(args.target_size)),
-        draw_initial_paths=not bool(args.no_initial_paths),
     )
     render_video(
         canvas=canvas,
@@ -160,6 +157,7 @@ def main() -> None:
         line_width=max(1, int(args.line_width)),
         arrow_scale=max(0.0, float(args.sfm_arrow_scale)),
         draw_sfm_arrows=not bool(args.no_sfm_arrows),
+        draw_planned_paths=not bool(args.no_initial_paths),
         show_yaw_source_labels=bool(args.show_yaw_source_labels),
         show_text=not bool(args.no_text),
     )
@@ -186,9 +184,6 @@ def make_canvas(
     path_data: dict[str, Any],
     metadata: dict[str, Any],
     crop_center_pixels: int,
-    line_width: int,
-    target_size: int,
-    draw_initial_paths: bool = True,
 ) -> MapCanvas:
     map_path = resolve_path(str(path_data.get("map_path") or metadata["map_path"]))
     image = Image.open(map_path).convert("L")
@@ -203,26 +198,8 @@ def make_canvas(
         origin_xy_value = default_center_origin((width, height), resolution)
     origin_xy = (float(origin_xy_value[0]), float(origin_xy_value[1]))
 
-    static = cropped.convert("RGBA")
-    overlay = Image.new("RGBA", static.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay, "RGBA")
-    for agent_id, agent in enumerate(path_data.get("agents", [])):
-        color = agent_color(agent_id)
-        if draw_initial_paths:
-            path = agent.get("path_xy", [])
-            if len(path) >= 2:
-                pixels = [
-                    world_to_crop_pixel(xy, width, height, resolution, origin_xy, crop_box)
-                    for xy in path
-                ]
-                draw.line(pixels, fill=(*color, 160), width=line_width, joint="curve")
-        goal_px = world_to_crop_pixel(
-            agent.get("goal_xy", [0.0, 0.0]), width, height, resolution, origin_xy, crop_box
-        )
-        draw_goal(draw, goal_px, target_size + 2, (*color, 235))
-
     return MapCanvas(
-        static_image=Image.alpha_composite(static, overlay).convert("RGB"),
+        static_image=cropped.convert("RGB"),
         full_size=(width, height),
         crop_box=crop_box,
         resolution=resolution,
@@ -244,6 +221,7 @@ def render_video(
     line_width: int,
     arrow_scale: float,
     draw_sfm_arrows: bool,
+    draw_planned_paths: bool,
     show_yaw_source_labels: bool,
     show_text: bool,
 ) -> None:
@@ -254,9 +232,11 @@ def render_video(
     font = load_font()
     positions = np.asarray([frame["positions_xy"] for frame in frames], dtype=np.float32)
     writer = make_video_writer(output_path, canvas.size, fps, scale)
+    path_records = current_path_records(path_data, num_agents)
 
     try:
         for frame_idx, frame in enumerate(frames):
+            apply_path_updates(path_records, frame.get("path_updates", []))
             image = canvas.static_image.copy().convert("RGBA")
             overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
             draw = ImageDraw.Draw(overlay, "RGBA")
@@ -274,6 +254,32 @@ def render_video(
 
             for agent_id in range(num_agents):
                 color = agent_color(agent_id)
+                path_record = path_records[agent_id]
+                if draw_planned_paths:
+                    path = path_record.get("path_xy", [])
+                    if len(path) >= 2:
+                        path_pixels = [
+                            world_to_crop_pixel(
+                                xy,
+                                full_width,
+                                full_height,
+                                canvas.resolution,
+                                canvas.origin_xy,
+                                canvas.crop_box,
+                            )
+                            for xy in path
+                        ]
+                        draw.line(path_pixels, fill=(*color, 135), width=line_width, joint="curve")
+                goal_px = world_to_crop_pixel(
+                    path_record.get("goal_xy", [0.0, 0.0]),
+                    full_width,
+                    full_height,
+                    canvas.resolution,
+                    canvas.origin_xy,
+                    canvas.crop_box,
+                )
+                draw_goal(draw, goal_px, target_size + 2, (*color, 235))
+
                 trail = positions[trail_start : frame_idx + 1, agent_id]
                 trail_pixels = [
                     world_to_crop_pixel(xy, full_width, full_height, canvas.resolution, canvas.origin_xy, canvas.crop_box)
@@ -341,7 +347,7 @@ def render_video(
                         repulsive_forces[agent_id],
                         REPULSIVE_ARROW_COLOR,
                         canvas,
-                        arrow_scale,
+                        arrow_scale*0.2,
                         width=2,
                     )
                     draw_world_arrow(
@@ -350,7 +356,7 @@ def render_video(
                         d_vel[agent_id],
                         D_VEL_ARROW_COLOR,
                         canvas,
-                        arrow_scale,
+                        arrow_scale*0.2,
                         width=2,
                     )
                 draw_cross(draw, waypoint_px, target_size, (*color, 210), WAYPOINT_OUTLINE)
@@ -378,6 +384,30 @@ def render_video(
             writer.write(rendered)
     finally:
         writer.close()
+
+
+def current_path_records(path_data: dict[str, Any], num_agents: int) -> list[dict[str, Any]]:
+    records = [dict(agent) for agent in path_data.get("agents", [])]
+    while len(records) < num_agents:
+        records.append(
+            {
+                "agent_id": len(records),
+                "goal_xy": [0.0, 0.0],
+                "path_xy": [],
+            }
+        )
+    return records[:num_agents]
+
+
+def apply_path_updates(path_records: list[dict[str, Any]], updates: Any) -> None:
+    if not updates:
+        return
+    for update in updates:
+        if not isinstance(update, dict):
+            continue
+        agent_id = int(update.get("agent_id", -1))
+        if 0 <= agent_id < len(path_records):
+            path_records[agent_id] = dict(update)
 
 
 class OpenCvVideoWriter:

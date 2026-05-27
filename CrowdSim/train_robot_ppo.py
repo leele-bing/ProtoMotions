@@ -28,7 +28,12 @@ from CrowdSim.utils.humanoid_state_recorder import (  # noqa: E402
 from CrowdSim.utils.map_metadata import OccupancyMapMetadata, load_occupancy_map_metadata  # noqa: E402
 from CrowdSim.navigation import CrowdNavigationConfig, CrowdNavigationManager  # noqa: E402
 from CrowdSim.differential_control import DifferentialDriveConfig  # noqa: E402
-from CrowdSim.robot_ppo import RobotPPOConfig, RobotPPOTrainer, RobotRolloutBuffer  # noqa: E402
+from CrowdSim.robot_ppo import (  # noqa: E402
+    RobotPPOConfig,
+    RobotPPOTrainer,
+    RobotRolloutBuffer,
+    robot_network_kwargs,
+)
 from CrowdSim.utils.sensor_stream import RobotCameraStreamConfig, configure_robot_camera_recorder  # noqa: E402
 from CrowdSim.sim_agent import (  # noqa: E402
     build_runtime,
@@ -64,6 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minibatch-size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--hidden-dim", type=int, default=None)
+    parser.add_argument("--num-layers", type=int, default=None)
     parser.add_argument("--save-interval", type=int, default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--resume", default=None)
@@ -120,6 +126,7 @@ def main() -> None:
 
     scene_prim_path = str(scene_cfg.get("prim_path", "/World/Scene"))
     scene_z_offset = float(scene_cfg.get("z_offset", 0.0))
+    terrain_xy_offset = parse_xy_pair(scene_cfg.get("terrain_xy_offset"))
     scene_loaded_in_scene_cfg = args.scene_physics or crowd_robot_config is not None
     if scene_loaded_in_scene_cfg:
         patch_isaaclab_scene_with_crowdsim_assets(
@@ -127,6 +134,7 @@ def main() -> None:
             scene_z_offset=scene_z_offset,
             scene_prim_path=scene_prim_path,
             crowd_robot=crowd_robot_config,
+            terrain_xy_offset=terrain_xy_offset,
         )
 
     runtime = build_runtime(
@@ -174,7 +182,11 @@ def main() -> None:
         obs_dim=nav_manager.robot_rl_obs_dim,
         vector_obs_dim=nav_manager.robot_rl_vector_obs_dim,
         map_size=nav_manager.config.rl_map_size,
-        hidden_dim=int(config_value(args.hidden_dim, network_cfg, "hidden_dim", 128)),
+        **robot_network_kwargs(
+            network_cfg,
+            hidden_dim_override=args.hidden_dim,
+            num_layers_override=args.num_layers,
+        ),
         lr=float(config_value(args.lr, training_cfg, "lr", 3.0e-4)),
         ppo_epochs=int(config_value(args.ppo_epochs, training_cfg, "ppo_epochs", 4)),
         minibatch_size=int(config_value(args.minibatch_size, training_cfg, "minibatch_size", 256)),
@@ -266,6 +278,18 @@ def train_loop(
     )
     while robot_steps < total_steps:
         buffer.reset()
+        rollout_samples = 0
+        rollout_sums = {
+            "reached": 0.0,
+            "collision": 0.0,
+            "timeout": 0.0,
+            "goal_distance": 0.0,
+            "progress_target_distance": 0.0,
+            "progress": 0.0,
+            "reward_total": 0.0,
+            "reward_progress": 0.0,
+            "reward_terminal": 0.0,
+        }
         for _ in range(buffer.rollout_steps):
             obs, _ = env.reset(done_indices)
             obs = agent.add_agent_info_to_obs(obs)
@@ -280,6 +304,48 @@ def train_loop(
             nav_manager.set_robot_rl_actions(robot_action)
             _, _, humanoid_dones, _, _ = env.step(humanoid_action)
             _, robot_reward, robot_done, info = nav_manager.get_robot_rl_feedback()
+
+            zero_reward = torch.zeros_like(robot_reward)
+            nav_step_mask = info.get(
+                "is_navigation_step",
+                torch.ones_like(robot_done, dtype=torch.bool),
+            ).float()
+            reward_goal = info.get("reward_goal", zero_reward).float()
+            reward_collision = info.get("reward_collision", zero_reward).float()
+            reward_timeout = info.get("reward_timeout", zero_reward).float()
+            rollout_samples += int(nav_step_mask.sum().item())
+            rollout_sums["reached"] += (
+                info.get("reached", torch.zeros_like(robot_done)).float().sum().item()
+            )
+            rollout_sums["collision"] += (
+                info.get("collision", torch.zeros_like(robot_done)).float().sum().item()
+            )
+            rollout_sums["timeout"] += (
+                info.get("timeout", torch.zeros_like(robot_done)).float().sum().item()
+            )
+            rollout_sums["goal_distance"] += (
+                (info.get("distance_to_goal", zero_reward).float() * nav_step_mask).sum().item()
+            )
+            rollout_sums["progress_target_distance"] += (
+                (
+                    info.get("distance_to_progress_target", zero_reward).float()
+                    * nav_step_mask
+                )
+                .sum()
+                .item()
+            )
+            rollout_sums["progress"] += (
+                (info.get("progress", zero_reward).float() * nav_step_mask).sum().item()
+            )
+            rollout_sums["reward_total"] += (
+                (info.get("reward_total", robot_reward).float() * nav_step_mask).sum().item()
+            )
+            rollout_sums["reward_progress"] += (
+                (info.get("reward_progress", zero_reward).float() * nav_step_mask).sum().item()
+            )
+            rollout_sums["reward_terminal"] += (
+                (reward_goal + reward_collision + reward_timeout) * nav_step_mask
+            ).sum().item()
 
             buffer.add(robot_obs, raw_action, log_prob, robot_reward, robot_done, value)
             episode_returns += robot_reward
@@ -309,27 +375,22 @@ def train_loop(
         recent_lengths = completed_lengths[-100:]
         mean_return = sum(recent_returns) / max(len(recent_returns), 1)
         mean_length = sum(recent_lengths) / max(len(recent_lengths), 1)
-        reached = info.get("reached", torch.zeros_like(robot_done)).float().mean().item()
-        collision = info.get("collision", torch.zeros_like(robot_done)).float().mean().item()
-        timeout = info.get("timeout", torch.zeros_like(robot_done)).float().mean().item()
-        goal_distance = info.get("distance_to_goal", torch.zeros_like(robot_reward)).float().mean().item()
+        rollout_denominator = max(rollout_samples, 1)
+        reached = rollout_sums["reached"]
+        collision = rollout_sums["collision"]
+        timeout = rollout_sums["timeout"]
+        goal_distance = rollout_sums["goal_distance"] / rollout_denominator
         progress_target_distance = (
-            info.get("distance_to_progress_target", torch.zeros_like(robot_reward))
-            .float()
-            .mean()
-            .item()
+            rollout_sums["progress_target_distance"] / rollout_denominator
         )
-        progress = info.get("progress", torch.zeros_like(robot_reward)).float().mean().item()
-        reward_total = info.get("reward_total", robot_reward).float().mean().item()
-        reward_progress = info.get("reward_progress", torch.zeros_like(robot_reward)).float().mean().item()
-        reward_goal = info.get("reward_goal", torch.zeros_like(robot_reward)).float().mean().item()
-        reward_collision = info.get("reward_collision", torch.zeros_like(robot_reward)).float().mean().item()
-        reward_timeout = info.get("reward_timeout", torch.zeros_like(robot_reward)).float().mean().item()
-        reward_terminal = reward_goal + reward_collision + reward_timeout
+        progress = rollout_sums["progress"] / rollout_denominator
+        reward_total = rollout_sums["reward_total"] / rollout_denominator
+        reward_progress = rollout_sums["reward_progress"] / rollout_denominator
+        reward_terminal = rollout_sums["reward_terminal"] / rollout_denominator
         print(
             f"[CrowdSim][PPO] robot_steps={robot_steps} "
             f"return={mean_return:.3f} len={mean_length:.1f} "
-            f"reached={reached:.2f} collision={collision:.2f} timeout={timeout:.2f} "
+            f"reached={reached:.0f} collision={collision:.0f} timeout={timeout:.0f} "
             f"goal_distance={goal_distance:.3f} sfm_target_distance={progress_target_distance:.3f} "
             f"progress={progress:.3f} "
             f"reward={reward_total:.3f} progress_reward={reward_progress:.3f} "
@@ -384,23 +445,23 @@ class RobotTrainingLogger:
             self.tb.add_scalar("loss/value_loss", metrics["value_loss"], step)
             self.tb.add_scalar("loss/entropy", metrics["entropy"], step)
 
-            self.tb.add_scalar("reward/total", metrics["reward_total"], step)
-            self.tb.add_scalar("reward/progress", metrics["reward_progress"], step)
-            self.tb.add_scalar("reward/terminal", metrics["reward_terminal"], step)
+            self.tb.add_scalar("step/reward_total", metrics["reward_total"], step)
+            self.tb.add_scalar("step/reward_progress", metrics["reward_progress"], step)
+            self.tb.add_scalar("step/reward_terminal", metrics["reward_terminal"], step)
+            self.tb.add_scalar("step/progress", metrics["progress"], step)
+            self.tb.add_scalar("step/goal_distance", metrics["goal_distance"], step)
+            self.tb.add_scalar(
+                "step/progress_target_distance",
+                metrics["progress_target_distance"],
+                step,
+            )
+
+            self.tb.add_scalar("episode/return", metrics["mean_return"], step)
+            self.tb.add_scalar("episode/length", metrics["mean_length"], step)
 
             self.tb.add_scalar("outcome/reached", metrics["reached"], step)
             self.tb.add_scalar("outcome/collision", metrics["collision"], step)
             self.tb.add_scalar("outcome/timeout", metrics["timeout"], step)
-
-            self.tb.add_scalar("mean/return", metrics["mean_return"], step)
-            self.tb.add_scalar("mean/length", metrics["mean_length"], step)
-            self.tb.add_scalar("mean/goal_distance", metrics["goal_distance"], step)
-            self.tb.add_scalar(
-                "mean/progress_target_distance",
-                metrics["progress_target_distance"],
-                step,
-            )
-            self.tb.add_scalar("mean/progress", metrics["progress"], step)
 
     def close(self) -> None:
         if self.tb is not None:
@@ -480,6 +541,19 @@ def cfg_path(path_like: str) -> Path:
     return (PROJECT_ROOT / path).resolve()
 
 
+def parse_xy_pair(value) -> tuple[float, float] | None:
+    if value is None:
+        return None
+    values = (
+        [item.strip() for item in value.split(",")]
+        if isinstance(value, str)
+        else list(value)
+    )
+    if len(values) != 2:
+        raise ValueError(f"Expected two XY values, got {value!r}")
+    return float(values[0]), float(values[1])
+
+
 def validate_paths(paths: dict[str, Path]) -> None:
     for label, path in paths.items():
         if not path.exists():
@@ -520,6 +594,7 @@ def build_navigation_manager(
     local_cfg = nav_cfg.get("local", {})
     recording_cfg = nav_cfg.get("recording", {})
     humanoid_cfg = cfg.get("humanoid", {})
+    car_cfg = cfg.get("car", {})
     marker_cfg = get_marker_config(cfg)
     rl_cfg = get_robot_rl_config(cfg)
     reward_cfg = get_reward_config(rl_cfg)
@@ -559,6 +634,7 @@ def build_navigation_manager(
             ),
             differential_drive=make_differential_drive_config(rl_cfg),
             car_rl_policy=True,
+            car_drive_mode=str(car_cfg.get("drive_mode", "wheel")),
             rl_num_neighbors=int(rl_cfg.get("num_neighbors", 4)),
             rl_max_linear_velocity=float(rl_cfg.get("max_linear_velocity", 2.0)),
             rl_max_angular_velocity=float(rl_cfg.get("max_angular_velocity", 2.0)),

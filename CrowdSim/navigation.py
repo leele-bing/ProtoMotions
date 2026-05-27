@@ -53,6 +53,7 @@ class CrowdNavigationConfig:
     local_target_timestep: float = 1.0
     humanoid_target_min_heading_speed: float = 0.05
     car_rl_policy: bool = True
+    car_drive_mode: str = "wheel"
     rl_num_neighbors: int = 4
     rl_max_linear_velocity: float = 2.0
     rl_max_angular_velocity: float = 2.0
@@ -132,6 +133,9 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
             "initial",
             dtype=object,
         )
+        self._pending_path_updates: list[dict[str, object]] = []
+        self._path_log_dirty = False
+        self._pending_humanoid_reset_reasons: dict[int, str] = {}
         self._printed_masked_mimic_target_warning = False
         self._local_target_marker = None
         self.path_log_path = self._write_navigation_path_log()
@@ -248,8 +252,11 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
                 self.pre_step()
             result = original_step(action)
             self.env_step_count += 1
+            self._apply_robot_drive_after_env_step()
             if should_update_navigation:
                 self.post_step()
+            else:
+                self._clear_robot_rl_env_step_feedback()
             return result
 
         env.reset = types.MethodType(reset_with_navigation, env)
@@ -267,7 +274,8 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
         )
         print(
             f"[CrowdSim] Navigation enabled: {self.config.num_humanoids} humanoid(s), "
-            f"{self.config.num_robots} robot(s), car_rl_policy={self.config.car_rl_policy}."
+            f"{self.config.num_robots} robot(s), car_rl_policy={self.config.car_rl_policy}, "
+            f"car_drive_mode={self.config.car_drive_mode}."
         )
         print(
             "[CrowdSim] Navigation update rate: "
@@ -293,8 +301,17 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
         if self.config.num_robots == 0:
             return
 
-        wheel_targets = self._compute_robot_wheel_targets()
-        self._write_robot_wheel_targets(wheel_targets)
+        self._override_robot_rl_actions_with_constant_command()
+        if self.config.car_drive_mode == "kinematic":
+            self._clear_robot_wheel_targets()
+        elif self.config.car_drive_mode == "wheel":
+            wheel_targets = self._compute_robot_wheel_targets()
+            self._write_robot_wheel_targets(wheel_targets)
+        else:
+            raise ValueError(
+                f"Unsupported car.drive_mode='{self.config.car_drive_mode}'. "
+                "Expected 'wheel' or 'kinematic'."
+            )
 
     def post_step(self) -> None:
         self.step_count += 1
@@ -304,6 +321,7 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
         nav_done_ids = self._navigation_done_agent_ids(new_pairs)
         self._request_humanoid_resets(nav_done_ids)
         self._update_robot_rl_feedback(positions, velocities, new_pairs)
+        self._print_robot_drive_debug()
         self._last_positions = positions
         self.env.extras["crowdsim_navigation"] = {
             "reached": int(self.reached.sum()),
@@ -349,28 +367,9 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
         latest_path = output_dir / "paths_latest.json"
         timestamp_path = output_dir / f"paths_{timestamp}.json"
 
-        records = []
-        for agent_id, path in enumerate(self.paths_xy):
-            agent_type = "humanoid" if agent_id < self.config.num_humanoids else "car"
-            local_id = (
-                agent_id
-                if agent_type == "humanoid"
-                else agent_id - self.config.num_humanoids
-            )
-            record = {
-                "agent_id": agent_id,
-                "agent_type": agent_type,
-                "local_id": local_id,
-                "start_xy": self.starts_xy[agent_id].astype(float).tolist(),
-                "goal_xy": self.goals_xy[agent_id].astype(float).tolist(),
-                "path_xy": path.astype(float).tolist(),
-            }
-            records.append(record)
-            print(
-                f"[CrowdSim] path {agent_type}_{local_id}: "
-                f"start={record['start_xy']}, goal={record['goal_xy']}, "
-                f"waypoints={len(record['path_xy'])}"
-            )
+        records = [self._navigation_path_record(agent_id) for agent_id in range(self.num_agents)]
+        self._path_log_dirty = False
+        self.path_log_path = latest_path
 
         payload = {
             "created_at": timestamp,
@@ -425,6 +424,30 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
         self._trajectory_timestamp_file.flush()
         return latest_path
 
+    def _navigation_path_record(self, agent_id: int) -> dict[str, object]:
+        agent_type = "humanoid" if agent_id < self.config.num_humanoids else "car"
+        local_id = agent_id if agent_type == "humanoid" else agent_id - self.config.num_humanoids
+        return {
+            "agent_id": agent_id,
+            "agent_type": agent_type,
+            "local_id": local_id,
+            "start_xy": self.starts_xy[agent_id].astype(float).tolist(),
+            "goal_xy": self.goals_xy[agent_id].astype(float).tolist(),
+            "path_xy": self.paths_xy[agent_id].astype(float).tolist(),
+        }
+
+    def _consume_pending_path_updates(self) -> list[dict[str, object]]:
+        if not self._pending_path_updates:
+            return []
+        updates = self._pending_path_updates
+        self._pending_path_updates = []
+        return updates
+
+    def _flush_navigation_path_log_if_dirty(self) -> None:
+        if not self._path_log_dirty:
+            return
+        self._write_navigation_path_log()
+
     def _record_trajectory_frame(self, positions: np.ndarray, velocities: np.ndarray) -> None:
         if self._trajectory_log_file is None:
             return
@@ -452,6 +475,9 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
             "reached": self.reached.astype(bool).tolist(),
             "collision_pairs": [list(pair) for pair in sorted(self.collision_pairs)],
         }
+        path_updates = self._consume_pending_path_updates()
+        if path_updates:
+            frame["path_updates"] = path_updates
         line = json.dumps(frame) + "\n"
         self._trajectory_log_file.write(line)
         if self._trajectory_timestamp_file is not None:
@@ -758,8 +784,20 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
         humanoid_ids = agent_ids[(0 <= agent_ids) & (agent_ids < self.config.num_humanoids)]
         if len(humanoid_ids) == 0:
             return
+        for agent_id in humanoid_ids:
+            self._pending_humanoid_reset_reasons[int(agent_id)] = self._humanoid_reset_reason(
+                int(agent_id)
+            )
         ids = torch.as_tensor(humanoid_ids, dtype=torch.long, device=self.config.device)
         self.env.reset_buf[ids] = True
+
+    def _humanoid_reset_reason(self, agent_id: int) -> str:
+        reasons = []
+        if bool(self.reached[agent_id]):
+            reasons.append("reached")
+        if any(agent_id in pair for pair in self.collision_pairs):
+            reasons.append("collision")
+        return "+".join(reasons) if reasons else "external"
 
     def _detect_collisions(self, positions: np.ndarray) -> set[tuple[int, int]]:
         new_pairs: set[tuple[int, int]] = set()
@@ -804,8 +842,17 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
         if len(humanoid_ids) > 0:
             positions, _ = self._read_agent_state()
             for agent_id in humanoid_ids:
+                reason = self._pending_humanoid_reset_reasons.pop(
+                    int(agent_id),
+                    "external",
+                )
                 self._replan_agent_from_xy(int(agent_id), positions[int(agent_id)])
                 self._humanoid_yaw_source[int(agent_id)] = "reset"
+                print(
+                    "[CrowdSim] reset humanoid "
+                    f"env={int(agent_id)} agent={int(agent_id)} reason={reason}"
+                )
+            self._flush_navigation_path_log_if_dirty()
 
     def _replan_agent_from_xy(self, agent_id: int, start_xy: np.ndarray) -> None:
         start_px, goal_px, path_xy = self.task.sample_goal_and_plan_path(start_xy)
@@ -825,6 +872,8 @@ class CrowdNavigationManager(RobotRLNavigationMixin):
             pair for pair in self.collision_pairs if agent_id not in pair
         }
         self.task.refresh_visualization_markers()
+        self._pending_path_updates.append(self._navigation_path_record(agent_id))
+        self._path_log_dirty = True
 
     def _current_waypoint(self, agent_id: int) -> np.ndarray:
         path = self.paths_xy[agent_id]

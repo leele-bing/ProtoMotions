@@ -297,12 +297,14 @@ def patch_isaaclab_scene_with_global_usd(
     usd_path: Path,
     z_offset: float = 0.0,
     prim_path: str = "/World/Scene",
+    terrain_xy_offset: tuple[float, float] | None = None,
 ) -> None:
     """Add a global USD asset to IsaacLab SceneCfg before simulator construction."""
     patch_isaaclab_scene_with_crowdsim_assets(
         scene_usd_path=usd_path,
         scene_z_offset=z_offset,
         scene_prim_path=prim_path,
+        terrain_xy_offset=terrain_xy_offset,
     )
 
 
@@ -311,6 +313,7 @@ def patch_isaaclab_scene_with_crowdsim_assets(
     scene_z_offset: float = 0.0,
     scene_prim_path: str = "/World/Scene",
     crowd_robot: CrowdRobotSceneConfig | None = None,
+    terrain_xy_offset: tuple[float, float] | None = None,
     office_usd_path: Path | None = None,
     office_z_offset: float | None = None,
     office_prim_path: str | None = None,
@@ -330,6 +333,9 @@ def patch_isaaclab_scene_with_crowdsim_assets(
     class CrowdSimSceneCfg(BaseSceneCfg):
         def __init__(self, *scene_args, **scene_kwargs):
             super().__init__(*scene_args, **scene_kwargs)
+            if terrain_xy_offset is not None:
+                _offset_trimesh_terrain_vertices_cfg(self.terrain, terrain_xy_offset)
+
             if usd_path is not None:
                 self.global_usd_asset = AssetBaseCfg(
                     prim_path=prim_path,
@@ -411,6 +417,21 @@ def patch_isaaclab_scene_with_crowdsim_assets(
                 )
 
     simulator_module.SceneCfg = CrowdSimSceneCfg
+
+
+def _offset_trimesh_terrain_vertices_cfg(
+    terrain_cfg,
+    xy_offset: tuple[float, float],
+) -> None:
+    if terrain_cfg is None or not hasattr(terrain_cfg, "terrain_vertices"):
+        return
+    vertices = getattr(terrain_cfg, "terrain_vertices", None)
+    if vertices is None:
+        return
+    offset_x, offset_y = float(xy_offset[0]), float(xy_offset[1])
+    for vertex in vertices:
+        vertex[0] = float(vertex[0]) + offset_x
+        vertex[1] = float(vertex[1]) + offset_y
 
 
 def apply_fixed_spawn_offsets(env, spawn_xy: torch.Tensor) -> None:
